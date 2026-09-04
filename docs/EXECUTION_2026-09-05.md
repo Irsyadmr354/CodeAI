@@ -1,0 +1,7 @@
+Eksekusi AUDIT_2026-09-04 — CONVERGED 2026-09-05. Baseline NO-GIT-REPO, pytest 9.1.1, awal 29p/2f → akhir 31p/0f. Dispatch same-turn tiap wave; runtime serial tapi instruksi paralel tercatat.
+
+Wave1: allowance.py shlex+chain→ASK + block IR + strict mode; orchestrator.py word-boundary+path-aware + verify_tool_call + precedence + active_subagent wiring; hooks.py fence YAML insensitive + block/deny + post bool/int aman + inject allowlist; compactor.py OSC strip + FATAL/Traceback/FAILED + marker budget ≤10 + keyword summary.
+Wave2: auth_vault.py chmod0600 + warn corrupt + env secret; ast_indexer.py recursive + JS indent/export/typed + removesuffix; shell_runner.py mask sk-/ghp-/AKIA/Bearer/token=/PEM + timeout30 + fail-closed; diff_editor.py tmp+replace atomic + empty ValueError + duplikat Ambiguous.
+Wave2b: google_oauth.py env-only + resolve vault + clear error; loop.py bound<max+1 + retries_used akurat + trim errors; super_skill.py shlex.quote + is-dir + AST delegasi.
+Wave3: cli.py +19 net — steer ◉/✓ forward, custom_providers wire, banner 3-baris count, prompt trunc24, fuzzy-direct, help 4-grup + alias /m/l/p/c/h/s/st/q + did-you-mean, spinner elapsed; /effort+/m+persist dipertahankan. Tests: bare→anthropic, oauth redacted, vault dummy env, gateway restore — FULL GREEN.
+Sweep agregat: nol secret live (2 hit hanya assertNot di test). Tanpa git → tanpa commit; rollback N/A. Aksi: review docs/EXECUTION ini, lalu git init + commit konvensional bila siap.

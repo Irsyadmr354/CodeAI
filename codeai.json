@@ -1,0 +1,42 @@
+{
+  "provider": {
+    "default": "opencode",
+    "active_model": "muse-spark-1.3-contributor-free",
+    "effort": "low",
+    "opencode_model": "mimo-v2.5-free",
+    "failover_order": [
+      "copilot",
+      "gemini",
+      "openai",
+      "ollama"
+    ]
+  },
+  "compaction": {
+    "trigger_limit": 50,
+    "token_budget": 8000
+  },
+  "allowance": {
+    "mode": "ask",
+    "whitelisted_commands": [
+      "ls",
+      "pwd",
+      "cat",
+      "echo",
+      "git status",
+      "git diff",
+      "grep"
+    ],
+    "blocked_patterns": [
+      "rm -rf /",
+      "sudo",
+      "chmod -R 777",
+      "chown",
+      "mkfs",
+      "dd if="
+    ]
+  },
+  "custom_providers": {},
+  "fallbackChains": {
+    "default": []
+  }
+}
