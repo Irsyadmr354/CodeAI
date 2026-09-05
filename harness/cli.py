@@ -264,47 +264,110 @@ class _TUIPicker:
         except Exception:
             pass
 
+    @staticmethod
+    def parse_key_sequence(seq: str) -> str:
+        """Pure parser sekuens-key -> token (unit-testable, tanpa TTY).
+
+        seq: raw string (mis. "\x1b", "\x1b[A", "\x1b[B", "\x1b[C",
+        "\x1b[D", "\x1b[H", "\x1b[F", "\x1bOA", "\r", "j", ...).
+        Return: up/down/left/right/home/end/enter/backspace/ctrl-c/space/
+        esc/j/k/q/single-char/unknown. CSI tak dikenal -> unknown
+        (JANGAN esc agar tak batal).
+        """
+        if not seq:
+            return "esc"
+        if seq in ("\r", "\n"):
+            return "enter"
+        if seq in ("\x7f", "\x08"):
+            return "backspace"
+        if seq in ("\x03", "\x04"):
+            return "ctrl-c"
+        if seq == " ":
+            return "space"
+        if seq == "\x1b":
+            return "esc"
+        if seq.startswith("\x1b[") or seq.startswith("\x1bO"):
+            if len(seq) < 3:
+                return "unknown"
+            final = seq[-1]
+            if final == "A":
+                return "up"
+            if final == "B":
+                return "down"
+            if final == "C":
+                return "right"
+            if final == "D":
+                return "left"
+            if final in ("H",):
+                return "home"
+            if final in ("F",):
+                return "end"
+            if final == "~":
+                try:
+                    _num = seq[2:-1].split(";")[0].strip()
+                    if _num in ("1", "7"):
+                        return "home"
+                    if _num in ("4", "8"):
+                        return "end"
+                except Exception:
+                    pass
+                return "unknown"
+            return "unknown"
+        if len(seq) == 1 and seq.lower() in ("j", "k", "q"):
+            return seq.lower()
+        if len(seq) == 1 and (seq.isprintable() or ord(seq) > 127):
+            return seq
+        return "unknown"
+
     def _read_key(self) -> str:
         import select
         ch = sys.stdin.read(1)
         if not ch:
             return "esc"
-        if ch == "\x1b":
-            r, _, _ = select.select([sys.stdin], [], [], 0.08)
-            if not r:
-                return "esc"
-            ch2 = sys.stdin.read(1)
-            if ch2 == "[":
-                r2, _, _ = select.select([sys.stdin], [], [], 0.08)
-                if r2:
-                    ch3 = sys.stdin.read(1)
-                    if ch3 == "A":
-                        return "up"
-                    if ch3 == "B":
-                        return "down"
-                return "esc"
+        if ch != "\x1b":
+            if ch in ("\r", "\n"):
+                return "enter"
+            if ch in ("\x7f", "\x08"):
+                return "backspace"
+            if ch in ("\x03", "\x04"):
+                return "ctrl-c"
+            if ch == " ":
+                return "space"
+            if len(ch) == 1 and ch.lower() in ("j", "k", "q"):
+                return ch.lower()
+            if len(ch) == 1 and (ch.isprintable() or ord(ch) > 127):
+                return ch
+            return "unknown"
+        r, _, _ = select.select([sys.stdin], [], [], 0.08)
+        if not r:
             return "esc"
-        if ch in ("\r", "\n"):
-            return "enter"
-        if ch in ("\x7f", "\x08"):
-            return "backspace"
-        if ch in ("\x03", "\x04"):
-            return "ctrl-c"
-        if ch == " ":
-            return "space"
-        if len(ch) == 1 and ch.lower() in ("j", "k", "q"):
-            return ch.lower()
-        if len(ch) == 1 and (ch.isprintable() or ord(ch) > 127):
-            return ch
-        return "unknown"
+        ch2 = sys.stdin.read(1)
+        if not ch2:
+            return "esc"
+        if ch2 not in ("[", "O"):
+            return "esc"
+        seq = ch + ch2
+        for _ in range(8):
+            r2, _, _ = select.select([sys.stdin], [], [], 0.08)
+            if not r2:
+                break
+            chN = sys.stdin.read(1)
+            if not chN:
+                break
+            seq += chN
+            if chN.isalpha() or chN == "~":
+                break
+        return self.parse_key_sequence(seq)
 
     def _handle_key(self, key):
         """Return 'select'/'cancel'/None. Mutasi query/idx/selected."""
         filt = self.filtered()
         total = len(filt)
-        if key in ("up", "down"):
+        if key in ("up", "down", "home", "end"):
             if total:
                 self.idx = _tui_move(self.idx, total, key)
+            return None
+        if key in ("left", "right", "unknown"):
             return None
         if isinstance(key, str) and key in ("j", "k"):
             if total:
@@ -561,7 +624,7 @@ class CodeAICLI:
             t = str(text or "").lower()
         except Exception:
             return False
-        keys = ("credential", "auth", "/login", "api key", "apikey",
+        keys = ("credential", "auth", "/provider", "api key", "apikey",
                 "unauthorized", "401", "forbidden", "403", "token",
                 "agy", "re-authenticate", "authenticate")
         return any(k in t for k in keys)
@@ -690,9 +753,9 @@ class CodeAICLI:
             _cause = raw
             if "last error:" in low:
                 _cause = raw[low.rfind("last error:") + len("last error:"):].strip().rstrip(".").strip()
-                # Buang hint trailing "run '/login...'" bila menempel.
+                # Buang hint trailing "run '/provider...'" bila menempel.
                 _ll = _cause.lower()
-                _cut = _ll.find("run '/login")
+                _cut = _ll.find("run '/provider")
                 if _cut > 20:
                     _cause = _cause[:_cut].strip().rstrip(".").strip()
                 else:
@@ -705,7 +768,7 @@ class CodeAICLI:
                 if _idx != -1:
                     _tail = raw[_idx + 2:].strip()
                     _lt = _tail.lower()
-                    _c = _lt.find("run '/login")
+                    _c = _lt.find("run '/provider")
                     if _c > 0:
                         _tail = _tail[:_c].strip().rstrip(".").strip()
                     else:
@@ -766,7 +829,7 @@ class CodeAICLI:
                     lines.append("• ollama: skipped (not running — jalankan `ollama serve`)")
                 elif _ps == _owner:
                     if self._is_auth_like(_cause):
-                        lines.append(f"• ollama: {_cause} → saran /login ollama")
+                        lines.append(f"• ollama: {_cause} → saran /provider ollama")
                     elif self._is_conn_like(_cause):
                         lines.append(f"• ollama: {_cause} → cek koneksi atau /model")
                     else:
@@ -775,10 +838,10 @@ class CodeAICLI:
                     lines.append("• ollama: dicoba (failover)")
                 continue
             if _ps not in conn_set:
-                lines.append(f"• {_ps}: not connected → saran /login {_ps}")
+                lines.append(f"• {_ps}: not connected → saran /provider {_ps}")
             elif _ps == _owner:
                 if self._is_auth_like(_cause):
-                    lines.append(f"• {_ps}: {_cause} → saran /login {_ps}")
+                    lines.append(f"• {_ps}: {_cause} → saran /provider {_ps}")
                 elif self._is_conn_like(_cause):
                     lines.append(f"• {_ps}: {_cause} → cek koneksi atau /model")
                 else:
@@ -792,7 +855,7 @@ class CodeAICLI:
             except Exception:
                 pass
         else:
-            lines.append("Saran: /login <provider> untuk menghubungkan (lihat /providers)")
+            lines.append("Saran: /provider <provider> untuk menghubungkan (lihat /providers)")
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -1042,10 +1105,10 @@ class CodeAICLI:
         short = self._short(model)
         if RICH_AVAILABLE:
             console.print(f"[bold blue]CodeAI Harness[/bold blue] [dim]v0.1.0[/dim]  [cyan]{provider}[/cyan]/[yellow]{short}[/yellow]  [dim]{n_conn} connected · {eff} · {el}[/dim]")
-            console.print(f"  [dim]AGENTS:{ag} HOOKS:{hk}  │  /help /model /login /combo /quit  (Ctrl-C steer)[/dim]")
+            console.print(f"  [dim]AGENTS:{ag} HOOKS:{hk}  │  /help /model /provider /combo /quit  (Ctrl-C steer)[/dim]")
         else:
             print(f"CodeAI Harness v0.1.0  |  {provider}/{short}  |  {n_conn} connected · {eff} · {el}")
-            print(f"AGENTS:{ag} HOOKS:{hk}  |  /help /model /login /combo /quit  (Ctrl-C steer)")
+            print(f"AGENTS:{ag} HOOKS:{hk}  |  /help /model /provider /combo /quit  (Ctrl-C steer)")
 
     def run(self):
         self.startup()
@@ -1138,8 +1201,6 @@ class CodeAICLI:
             "/config":    lambda: self.show_config(),
             "/steer":     lambda: self.steer_orchestrator(args) if args else _print("[yellow]Usage: /steer <instruction>[/yellow]"),
             "/st":        lambda: self.steer_orchestrator(args) if args else _print("[yellow]Usage: /steer <instruction>[/yellow]"),
-            "/login":     lambda: self.handle_login(args),
-            "/l":         lambda: self.handle_login(args),
             "/providers": lambda: self.show_providers(args),
             "/p":         lambda: self.show_providers(args),
             "/provider":  lambda: self.handle_provider(args),
@@ -1371,19 +1432,30 @@ class CodeAICLI:
             result = result or "_No response._"
             dt = time.monotonic() - t0
             self._last_elapsed = dt
-            failed = str(result).startswith(("❌", "🚫", "Task failed"))
+            try:
+                _chk = result.get("content", "") if isinstance(result, dict) else str(result)
+            except Exception:
+                _chk = str(result)
+            failed = str(_chk).startswith(("❌", "🚫", "Task failed"))
             if failed:
                 try:
-                    _detail = self._format_task_error(provider, model, str(result))
+                    _detail = self._format_task_error(provider, model, str(_chk))
                 except Exception:
                     _detail = ""
                 if _detail:
-                    _print(f"{result}\n{_detail}  [dim](type /help)[/dim]", style="red")
+                    _print(f"{_chk}\n{_detail}  [dim](type /help)[/dim]", style="red")
                 else:
-                    _print(f"{result}  [dim](run /login or /model — type /help)[/dim]", style="red")
+                    _print(f"{_chk}  [dim](run /provider or /model — type /help)[/dim]", style="red")
             else:
+                try:
+                    _content = result.get("content", "") if isinstance(result, dict) else str(result)
+                except Exception:
+                    _content = str(result)
                 _print(f"[dim]· {provider}/{short} · {dt:.1f}s ─[/dim]")
-                console.print(Markdown(str(result)))
+                try:
+                    console.print(Markdown(str(_content)))
+                except Exception:
+                    console.print(str(_content))
         elif RICH_AVAILABLE:
             # Rich ada tapi Live/Spinner tak tersedia → Status statis (legacy).
             # Worker sudah jalan di atas; tinggal tunggu (jangan run ulang).
@@ -1393,19 +1465,30 @@ class CodeAICLI:
             result = result or "_No response._"
             dt = time.monotonic() - t0
             self._last_elapsed = dt
-            failed = str(result).startswith(("❌", "🚫", "Task failed"))
+            try:
+                _chk2 = result.get("content", "") if isinstance(result, dict) else str(result)
+            except Exception:
+                _chk2 = str(result)
+            failed = str(_chk2).startswith(("❌", "🚫", "Task failed"))
             if failed:
                 try:
-                    _detail2 = self._format_task_error(provider, model, str(result))
+                    _detail2 = self._format_task_error(provider, model, str(_chk2))
                 except Exception:
                     _detail2 = ""
                 if _detail2:
-                    _print(f"{result}\n{_detail2}  [dim](type /help)[/dim]", style="red")
+                    _print(f"{_chk2}\n{_detail2}  [dim](type /help)[/dim]", style="red")
                 else:
-                    _print(f"{result}  [dim](run /login or /model — type /help)[/dim]", style="red")
+                    _print(f"{_chk2}  [dim](run /provider or /model — type /help)[/dim]", style="red")
             else:
+                try:
+                    _content2 = result.get("content", "") if isinstance(result, dict) else str(result)
+                except Exception:
+                    _content2 = str(result)
                 _print(f"[dim]─ [/dim][bold green]{provider} ◆[/bold green][dim] · {short} · {dt:.1f}s ─[/dim]")
-                console.print(Markdown(str(result)))
+                try:
+                    console.print(Markdown(str(_content2)))
+                except Exception:
+                    console.print(str(_content2))
         else:
             # Non-rich: ticker elapsed via \r + token mengalir inline (flush).
             # Label provider PENUH + model short.
@@ -1470,21 +1553,29 @@ class CodeAICLI:
             result = _box.get("r", _box.get("e", "No response."))
             dt = time.monotonic() - t0
             self._last_elapsed = dt
-            if str(result).startswith(("❌", "🚫", "Task failed")):
+            try:
+                _chk3 = result.get("content", "") if isinstance(result, dict) else str(result)
+            except Exception:
+                _chk3 = str(result)
+            if str(_chk3).startswith(("❌", "🚫", "Task failed")):
                 try:
-                    _detail3 = self._format_task_error(provider, model, str(result))
+                    _detail3 = self._format_task_error(provider, model, str(_chk3))
                 except Exception:
                     _detail3 = ""
                 if _detail3:
-                    print(f"\n─── Error ───\n{result}\n{_detail3}\n[{dt:.1f}s]")
+                    print(f"\n─── Error ───\n{_chk3}\n{_detail3}\n[{dt:.1f}s]")
                 else:
-                    print(f"\n─── Error ───\n{result}  (run /login or /model — type /help)\n[{dt:.1f}s]")
+                    print(f"\n─── Error ───\n{_chk3}  (run /provider or /model — type /help)\n[{dt:.1f}s]")
             elif _shown["n"] > 0:
                 # Jawaban sudah mengalir live → cukup footer elapsed.
                 print(f"\n─ {provider} ◆ · {short} · {dt:.1f}s ─ (selesai)")
             else:
+                try:
+                    _c3b = result.get("content", "") if isinstance(result, dict) else str(result)
+                except Exception:
+                    _c3b = str(_chk3)
                 # Fallback inkremental: flush kata-per-kata (stdlib only).
-                for _ch2 in self._word_chunks(str(result)):
+                for _ch2 in self._word_chunks(str(_c3b)):
                     try:
                         sys.stdout.write(_ch2)
                     except Exception:
@@ -1496,10 +1587,10 @@ class CodeAICLI:
                 print(f"\n─ {provider} ◆ · {short} · {dt:.1f}s ─")
 
     # ------------------------------------------------------------------
-    # /login
+    # _auth_provider (internal auth, via /provider)
     # ------------------------------------------------------------------
 
-    def handle_login(self, provider_name: str = ""):
+    def _auth_provider(self, provider_name: str = ""):
         provider_name = (provider_name or "").lower().strip()
         if not provider_name:
             # Tanpa arg → popup daftar provider ASLI + status connected.
@@ -1602,7 +1693,7 @@ class CodeAICLI:
 
         # (a) sesi lama via vault — masih valid → connected langsung + tawar switch.
         # Fast-path file session (kompat lama): discover → store → connected.
-        # Dianggap bagian dari "sesi lama via vault object" agar /login tetap
+        # Dianggap bagian dari "sesi lama via vault object" agar /provider tetap
         # instan bila sesi agy sudah ada (tanpa membuka browser).
         try:
             _stored = vault.get_token("antigravity")
@@ -1666,7 +1757,7 @@ class CodeAICLI:
         _missing_creds = (not _cid or not _csec)
         if _missing_creds:
             _print("[yellow]GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET belum diset — OAuth exchange kemungkinan gagal.[/yellow]")
-            _print("[dim]Set env GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET, atau login via `agy` sekali lalu ulangi /login antigravity.[/dim]")
+            _print("[dim]Set env GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET, atau login via `agy` sekali lalu ulangi /provider antigravity.[/dim]")
 
         # (b) Google OAuth intercept → dict/str creds → store → project.
         _creds = None
@@ -1685,7 +1776,7 @@ class CodeAICLI:
                 _intercept_error = ""
             _print("[red]OAuth intercept gagal.[/red]")
             if _missing_creds or "client" in _intercept_error.lower() or "secret" in _intercept_error.lower() or "exchange" in _intercept_error.lower():
-                _print("[dim]Set GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET, atau login via `agy` sekali lalu ulangi /login antigravity.[/dim]")
+                _print("[dim]Set GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET, atau login via `agy` sekali lalu ulangi /provider antigravity.[/dim]")
             _creds = None
 
         # (c) intercept None (user batal/timeout) → pesan batal jelas, lalu fallback (e).
@@ -1709,9 +1800,9 @@ class CodeAICLI:
                     pass
                 return
             if _intercept_error:
-                _print("[dim]Tidak ada sesi agy fallback. Jalankan `agy` untuk login lalu ulangi /login antigravity, atau ulangi OAuth setelah set client creds.[/dim]")
+                _print("[dim]Tidak ada sesi agy fallback. Jalankan `agy` untuk login lalu ulangi /provider antigravity, atau ulangi OAuth setelah set client creds.[/dim]")
             else:
-                _print("[dim]Tidak ada sesi agy fallback. Jalankan `agy` untuk login lalu ulangi /login antigravity, atau ulangi OAuth.[/dim]")
+                _print("[dim]Tidak ada sesi agy fallback. Jalankan `agy` untuk login lalu ulangi /provider antigravity, atau ulangi OAuth.[/dim]")
             return
 
         # Normalisasi creds: dict (baru) atau str (lama). Masking: tak pernah print token.
@@ -1755,7 +1846,7 @@ class CodeAICLI:
         if not _access:
             # (d) exchange gagal/creds kosong → instruksi, JANGAN crash → fallback (e).
             _print("[red]OAuth exchange gagal (creds kosong).[/red]")
-            _print("[dim]Set GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET, atau login via `agy` sekali lalu ulangi /login antigravity.[/dim]")
+            _print("[dim]Set GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET, atau login via `agy` sekali lalu ulangi /provider antigravity.[/dim]")
             try:
                 _fb2 = vault.discover_antigravity_token()
             except Exception:
@@ -1771,7 +1862,7 @@ class CodeAICLI:
                 except Exception:
                     pass
                 return
-            _print("[dim]Tidak ada sesi agy fallback. Jalankan `agy` untuk login lalu ulangi /login antigravity.[/dim]")
+            _print("[dim]Tidak ada sesi agy fallback. Jalankan `agy` untuk login lalu ulangi /provider antigravity.[/dim]")
             return
 
         # Simpan OAuth: prefer store_antigravity_oauth bila ada, else store_oauth.
@@ -1843,7 +1934,7 @@ class CodeAICLI:
         vault = AuthVault()
 
         _print("[dim]Gemini API (Google AI Studio) — for gemini-2.5-flash, gemini-2.5-pro, etc.[/dim]")
-        _print("[dim]For Antigravity models (gemini-3.8, claude, gpt-oss) use /login antigravity instead.[/dim]")
+        _print("[dim]For Antigravity models (gemini-3.8, claude, gpt-oss) use /provider antigravity instead.[/dim]")
         _print("[dim]Opening https://aistudio.google.com/app/apikey …[/dim]")
 
         try:
@@ -2039,27 +2130,88 @@ class CodeAICLI:
         _print()
 
     # ------------------------------------------------------------------
-    # /provider (custom OpenAI-compatible providers, stdlib only)
+    # /provider (auth unified builtin+custom, stdlib only)
     # ------------------------------------------------------------------
 
     def handle_provider(self, args: str = ""):
-        """Kelola custom provider tanpa sentuh file eksternal: /provider [add|list|remove]."""
+        """Auth/switch provider (builtin+custom): /provider [id|add|list|remove]. Tanpa arg → picker."""
         parts = (args or "").strip().split()
         sub = parts[0].lower() if parts else ""
         rest = " ".join(parts[1:]).strip() if len(parts) > 1 else ""
         if sub == "add":
             self._provider_add()
-        elif sub == "list":
+            return
+        if sub == "list":
             self._provider_list()
-        elif sub == "remove":
+            return
+        if sub == "remove":
             self._provider_remove(rest)
-        elif not sub:
-            _print("[yellow]Usage: /provider [add|list|remove][/yellow] [dim](tanpa arg → daftar)[/dim]")
-            self._provider_list()
-        else:
-            _print(f"[red]Unknown /provider subcommand: {sub}[/red] [dim](gunakan add|list|remove)[/dim]")
-            _print("[yellow]Usage: /provider [add|list|remove][/yellow]")
-            self._provider_list()
+            return
+        if not sub:
+            try:
+                provs = [p for p in self._list_providers_fast()
+                         if p.get("id") != "combo" and p.get("api") != "local"]
+            except Exception:
+                provs = []
+            if not provs:
+                self._provider_list()
+                return
+            items = [{"id": p["id"], "label": f"{p['id']} {'✅ connected' if p.get('has_credentials') else '○ not connected'} — {p.get('name', '')}", "has_credentials": bool(p.get("has_credentials"))} for p in provs]
+            _pick = self._tui_pick("Provider — pilih", items, show=lambda x: x["label"], initial="")
+            if _pick is None:
+                _print("[dim]Dibatalkan.[/dim]")
+                return
+            _pid = items[_pick]["id"]
+            _has = bool(items[_pick].get("has_credentials"))
+            if _has:
+                try:
+                    _conn = self._list_connected_fast()
+                except Exception:
+                    _conn = []
+                _mine = [m for m in (_conn or []) if str(m.get("provider", "")).lower() == str(_pid).lower()]
+                if _mine:
+                    try:
+                        self.switch_model(_mine[0]["id"])
+                    except Exception:
+                        try:
+                            self._set_active_provider(_pid, _mine[0].get("model", "default"))
+                        except Exception:
+                            pass
+                    return
+                self._auth_provider(_pid)
+                return
+            self._auth_provider(_pid)
+            return
+        _want = (parts[0] or "").strip()
+        _low = _want.lower()
+        _actual = None
+        try:
+            _provs2 = self._list_providers_fast()
+        except Exception:
+            _provs2 = []
+        for _p in _provs2 or []:
+            try:
+                if str(_p.get("id", "")).strip().lower() == _low:
+                    _actual = str(_p.get("id", "")).strip()
+                    break
+            except Exception:
+                continue
+        if _actual is None:
+            try:
+                _reg = self._registry()
+                _keys = list(getattr(_reg, "_providers", {}).keys())
+                for _k in _keys:
+                    if isinstance(_k, str) and _k.strip().lower() == _low:
+                        _actual = _k
+                        break
+            except Exception:
+                pass
+        if _actual is not None:
+            self._auth_provider(_actual)
+            return
+        _print(f"[red]Unknown provider '{_want}'.[/red] [dim](lihat /provider list)[/dim]")
+        self._provider_list()
+        return
 
     def _provider_prompt_secret(self, prompt_text: str = "API key (opsional, Enter=kosong): ") -> str:
         """Minta api key tersembunyi (tak pernah echo/log). Stdlib getpass dulu."""
@@ -2343,8 +2495,14 @@ class CodeAICLI:
                         _n = len(_md)
                     elif isinstance(_md, list):
                         _n = len(_md)
+                try:
+                    _reg_models = _reg.list_models(_pid) if _reg is not None and hasattr(_reg, "list_models") else []
+                    if _reg_models:
+                        _n = len(list(_reg_models))
+                except Exception:
+                    pass
                 _short_api = _api if len(_api) <= 34 else (_api[:31] + "…")
-                _rows.append((_pid, _name, _short_api, _n, _status, _has))
+                _rows.append((_pid, _name, _short_api, _n, _status))
             except Exception:
                 continue
         if RICH_AVAILABLE:
@@ -2354,7 +2512,7 @@ class CodeAICLI:
             table.add_column("BaseURL", no_wrap=True)
             table.add_column("Models", justify="right")
             table.add_column("Status")
-            for _pid, _name, _api_s, _n, _st, _ in _rows:
+            for _pid, _name, _api_s, _n, _st in _rows:
                 table.add_row(_pid, _name, _api_s or "—", str(_n), f"[green]{_st}[/green]" if "✅" in _st else f"[dim]{_st}[/dim]")
             console.print()
             console.print(table)
@@ -2362,7 +2520,7 @@ class CodeAICLI:
             console.print()
         else:
             print("\n── Providers (custom via /provider add) ──")
-            for _pid, _name, _api_s, _n, _st, _ in _rows:
+            for _pid, _name, _api_s, _n, _st in _rows:
                 _mark = "✅" if "✅" in _st else "○"
                 print(f"  {_mark} {_pid} ({_name}) [{_n} models] {_api_s or ''}")
             print("  /provider add · /provider remove <id> · /model untuk switch\n")
@@ -2516,6 +2674,7 @@ class CodeAICLI:
     def switch_model(self, model_str: str):
         registry = self._registry()
         connected = self._list_connected_fast()
+        _show_fn = lambda m: m["id"]  # noqa: E731
 
         def _generic_split(s: str):
             low = s.lower()
@@ -2662,9 +2821,13 @@ class CodeAICLI:
                 else:
                     _reject(raw_q)
                 return
-            if norm.isdigit() and 1 <= int(norm) <= len(connected):
-                _do_switch(connected[int(norm) - 1]["id"])
-                return
+            if norm.isdigit():
+                try:
+                    if 1 <= int(norm) <= len(connected):
+                        _do_switch(connected[int(norm) - 1]["id"])
+                        return
+                except Exception:
+                    pass
             if any(m["id"] == norm for m in connected):
                 _do_switch(norm)
                 return
@@ -2688,7 +2851,8 @@ class CodeAICLI:
                 _do_switch(_hits[0]["id"])
                 return
             # 0 atau banyak → TUI prefilled arg (refine live di dalam).
-            _pick = self._tui_pick("Model — pilih", connected, show=lambda m: m["id"], initial=raw_q)
+            _pool = connected
+            _pick = self._tui_pick("Model — pilih", _pool, show=_show_fn, initial=raw_q)
             if _pick is None:
                 # Batal: bila 0 cocok tampilkan REJECT verbatim, bila banyak cukup batal.
                 if len(_hits) == 0:
@@ -2696,18 +2860,19 @@ class CodeAICLI:
                 else:
                     _print("[dim]Dibatalkan.[/dim]")
                 return
-            _do_switch(connected[_pick]["id"])
+            _do_switch(_pool[_pick]["id"])
             return
 
         if not connected:
-            _print("[yellow]No connected providers. Run /login to connect.[/yellow]")
+            _print("[yellow]No connected providers. Run /provider to connect.[/yellow]")
             return
         # Tanpa arg → TUI SEMUA connected (live filter, viewport 15 ikut highlight).
-        _pick0 = self._tui_pick("Model — pilih", connected, show=lambda m: m["id"], initial="")
+        _pool0 = connected
+        _pick0 = self._tui_pick("Model — pilih", _pool0, show=_show_fn, initial="")
         if _pick0 is None:
             _print("[dim]Dibatalkan.[/dim]")
             return
-        _do_switch(connected[_pick0]["id"])
+        _do_switch(_pool0[_pick0]["id"])
         return
 
     # ------------------------------------------------------------------
@@ -2718,9 +2883,12 @@ class CodeAICLI:
         from harness.models.combo import ComboManager, ComboStrategy
         manager = ComboManager()
 
-        args = args.strip()
+        args = (args or "").strip()
+        _parts = args.split(None, 1)
+        _cmd = _parts[0].lower() if _parts else ""
+        _rest = _parts[1].strip() if len(_parts) > 1 else ""
 
-        if args == "list":
+        if _cmd == "list":
             combos = manager.list_combos()
             if not combos:
                 _print("[yellow]No combos saved.[/yellow]")
@@ -2747,10 +2915,37 @@ class CodeAICLI:
                     print(f"  {name}{_mark} [{data['strategy']}]: {', '.join(data['models'])}")
                 print()
 
-        elif not args or args == "create":
+        elif _cmd == "remove":
+            _name = _rest.strip()
+            if not _name:
+                _print("[yellow]Usage: /combo remove <nama>[/yellow]")
+                return
+            try:
+                _existing = manager.get_combo(_name)
+            except Exception:
+                _existing = None
+            if not _existing:
+                _print(f"[red]Combo '{_name}' tidak ditemukan.[/red] [dim](lihat /combo list)[/dim]")
+                return
+            try:
+                _conf = (Prompt.ask(f"Hapus combo '{_name}'?", choices=["y", "n"], default="n") if RICH_AVAILABLE else input(f"Hapus combo '{_name}'? [y/N]: "))
+            except (EOFError, KeyboardInterrupt):
+                _print("[dim]Dibatalkan.[/dim]")
+                return
+            if (_conf or "").strip().lower() != "y":
+                _print("[dim]Dibatalkan.[/dim]")
+                return
+            try:
+                manager.delete_combo(_name)
+            except Exception as _e:
+                _print(f"[red]Gagal hapus combo: {_e}[/red]")
+                return
+            _print(f"[bold green]✅ Combo '{_name}' dihapus.[/bold green]")
+            return
+        elif not _cmd or _cmd == "create":
             connected = self._list_connected_fast()
             if not connected:
-                _print("[yellow]No connected providers. Run /login first.[/yellow]")
+                _print("[yellow]No connected providers. Run /provider first.[/yellow]")
                 return
 
             # Alur: nama → strategi (12 semua) → multi-pilih model → simpan.
@@ -2781,7 +2976,7 @@ class CodeAICLI:
             if sw.strip().lower() == "y":
                 self.switch_model(f"combo/{name}")
         else:
-            _print("[yellow]Usage: /combo [list|create][/yellow] [dim](type /help)[/dim]")
+            _print("[yellow]Usage: /combo [list|create|remove <nama>][/yellow] [dim](type /help)[/dim]")
 
     # ------------------------------------------------------------------
     # /history
@@ -2912,10 +3107,10 @@ class CodeAICLI:
         groups = [
             ("Model", [("/model (/m)", "Switch — fuzzy query direct or selector; base-effort inline"),
                        ("/effort (/e)", "Show/set Antigravity effort (persisted)"),
-                       ("/combo (/c)", "Manage combos [list|create] (empty back)")]),
-            ("Auth", [("/login (/l)", "Authenticate provider"),
+                       ("/combo (/c)", "Manage combos [list|create|remove <nama>]")]),
+            ("Auth", [("/provider [id]", "Authenticate/switch provider"),
                       ("/providers (/p)", "List providers + status"),
-                      ("/provider", "Manage custom providers [add|list|remove]"),
+                      ("/provider add|list|remove", "Manage custom providers"),
                       ("/models <prov>", "List models for provider")]),
             ("Session", [("/steer (/st)", "Steer active subagent"),
                          ("/history", "Show history + fact cards"),
