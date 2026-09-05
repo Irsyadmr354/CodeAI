@@ -53,7 +53,7 @@ def _clean(text: str) -> str:
     return "\n".join(lines).strip()
 
 
-# Auth failure substrings (CLI stderr/stdout, lowercased) → explicit /login hint.
+# Auth failure substrings (CLI stderr/stdout, lowercased) → explicit /provider hint.
 # Deliberately narrow: must NOT match generic failures (e.g. unknown model)
 # so non-auth errors still fail over instead of fail-fast.
 _AUTH_ERROR_HINTS = (
@@ -379,15 +379,15 @@ class AntigravityProvider(BaseProvider):
                     detail = (body2 or body or "").strip()
                     suffix = f": {detail}" if detail else ""
                     raise ProviderError(
-                        f"Antigravity auth gagal, run /login antigravity{suffix}"
+                        f"Antigravity auth gagal, run /provider antigravity{suffix}"
                     )
                 except (urllib.error.URLError, TimeoutError) as e2:
                     raise ProviderError(
-                        f"Antigravity auth gagal, run /login antigravity: {e2}"
+                        f"Antigravity auth gagal, run /provider antigravity: {e2}"
                     )
             detail = (body or "").strip()
             suffix = f": {detail}" if detail else ""
-            raise ProviderError(f"Antigravity auth gagal, run /login antigravity{suffix}")
+            raise ProviderError(f"Antigravity auth gagal, run /provider antigravity{suffix}")
         except urllib.error.URLError as e:
             reason = getattr(e, "reason", e)
             if isinstance(reason, (socket.timeout, builtins.TimeoutError, TimeoutError)):
@@ -413,7 +413,7 @@ class AntigravityProvider(BaseProvider):
             raise ProviderError(
                 "Antigravity CLI (`agy`) not found in PATH.\n"
                 "Install from https://antigravity.google/docs/cli/install/ "
-                "then run `/login antigravity`."
+                "then run `/provider antigravity`."
             )
         except subprocess.TimeoutExpired:
             raise TimeoutError("Antigravity CLI timed out after 120s.")
@@ -421,11 +421,11 @@ class AntigravityProvider(BaseProvider):
         if proc.returncode != 0:
             err = (proc.stderr or proc.stdout or "").strip()
             if _is_auth_output(err):
-                # Fail-fast auth: explicit /login hint (gateway _is_auth_error catches
-                # "auth" + "/login"; never raise as TimeoutError/network).
+                # Fail-fast auth: explicit /provider hint (gateway _is_auth_error catches
+                # "auth" + "/provider"; never raise as TimeoutError/network).
                 detail = f": {err}" if err else ""
                 raise ProviderError(
-                    f"Antigravity auth gagal, run /login antigravity{detail}"
+                    f"Antigravity auth gagal, run /provider antigravity{detail}"
                 )
             raise ProviderError(
                 f"Antigravity CLI failed (exit {proc.returncode}): {err}"

@@ -18,7 +18,7 @@ class CopilotProvider(BaseProvider):
     def _get_oauth_token(self) -> str:
         token = self.vault.discover_copilot_token()
         if not token:
-            raise ProviderError("No GitHub Copilot token found. Please run '/login copilot' to authenticate.")
+            raise ProviderError("No GitHub Copilot token found. Please run '/provider copilot' to authenticate.")
         return token
 
     def device_flow_login(self) -> None:
