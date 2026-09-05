@@ -78,13 +78,13 @@ def _safe_parse_model_effort(model_str: Any) -> Any:
 
 
 def _is_auth_error(exc: BaseException) -> bool:
-    """True when an error looks like missing/invalid credentials (needs /login)."""
+    """True when an error looks like missing/invalid credentials (needs /provider)."""
     try:
         msg = f"{type(exc).__name__}: {exc}".lower()
     except Exception:
         return False
     keys = (
-        "credential", "auth", "/login", "api key", "apikey",
+        "credential", "auth", "/provider", "api key", "apikey",
         "unauthorized", "401", "forbidden", "403", "token",
         "agy", "re-authenticate", "authenticate",
     )
@@ -240,12 +240,15 @@ class LLMGateway:
                     return val.strip().lower()
         return None
 
-    def _apply_active_model(self, provider: BaseProvider, model: str) -> None:
+    def _apply_active_model(self, provider: BaseProvider, model: str, _allow_global_effort: bool = True) -> None:
         """
         Inject the selected model into the provider so it is used for this request.
         Normalises `base-effort` / `base:effort` suffixes: the API always
         receives the CLEAN base name; effort is stored on `provider.effort`.
         Thread-safe via _apply_lock (caller should still snapshot/restore).
+        When _allow_global_effort is False (combo-member isolated calls),
+        global config effort is NOT injected unless the member provider
+        explicitly supports effort (Antigravity EFFORT_MODELS); guard never crashes.
         """
         from harness.models.providers.antigravity import AntigravityProvider, EFFORT_MODELS, DEFAULT_ANTIGRAVITY_EFFORT
         with self._apply_lock:
@@ -259,6 +262,17 @@ class LLMGateway:
             if isinstance(effort, str):
                 effort = effort.strip().lower() or None
             cfg_effort = self._config_effort()
+            if not _allow_global_effort:
+                try:
+                    _supports = bool(
+                        isinstance(provider, AntigravityProvider)
+                        and isinstance(base, str)
+                        and base in EFFORT_MODELS
+                    )
+                except Exception:
+                    _supports = False
+                if not _supports:
+                    cfg_effort = None
             if isinstance(provider, AntigravityProvider):
                 provider.model = base
                 provider.effort = effort or cfg_effort or (
@@ -395,7 +409,7 @@ class LLMGateway:
                 if not api_key and not is_local:
                     raise ProviderError(
                         f"Credentials not found for provider '{_name}'. "
-                        f"Run '/login {_name}' to authenticate."
+                         f"Run '/provider {_name}' to authenticate."
                     )
 
                 provider = UniversalOpenAIProvider(
@@ -425,23 +439,51 @@ class LLMGateway:
         Send a chat request with automatic failover.
         model may be 'provider/model_name' or bare 'model_name'.
         """
-        # ---- Combo routing (whitespace-tolerant: "combo / x") ----
+        # ---- Combo routing (whitespace-tolerant: "combo / x" + bare R1 norm) ----
         effective_model = model or self.active_model
         if isinstance(effective_model, str):
             effective_model = effective_model.strip() or None
-        if effective_model and "/" in effective_model:
-            _c_left, _c_right = (p.strip() for p in effective_model.split("/", 1))
-            if _c_left == "combo":
-                from harness.models.combo import ComboManager, ComboProvider
-                combo_name = _c_right.strip()
-                manager = ComboManager()
-                combo_def = manager.get_combo(combo_name)
-                if not combo_def:
-                    raise ProviderError(f"Combo '{combo_name}' not found.")
-                provider = ComboProvider(combo_name, combo_def, gateway_config=self.config)
-                return provider.chat(messages, tools)
-        elif isinstance(effective_model, str) and effective_model.strip() == "combo":
-            raise ProviderError("Combo provider requires a combo name as model (e.g. combo/my_combo).")
+        _combo_name_to_run: Optional[str] = None
+        if isinstance(effective_model, str) and effective_model:
+            if "/" in effective_model:
+                _c_left, _c_right = (p.strip() for p in effective_model.split("/", 1))
+                if _c_left == "combo":
+                    _combo_name_to_run = (_c_right.strip() or None)
+                    if not _combo_name_to_run:
+                        raise ProviderError("Combo provider requires a combo name as model (e.g. combo/my_combo).")
+            else:
+                _bare = effective_model.strip()
+                if _bare == "combo":
+                    raise ProviderError("Combo provider requires a combo name as model (e.g. combo/my_combo).")
+                elif _bare:
+                    try:
+                        _def_raw = getattr(self.config, "default", "")
+                        _def_norm = _def_raw.strip() if isinstance(_def_raw, str) else _def_raw
+                    except Exception:
+                        _def_norm = None
+                    if _def_norm == "combo" and "/" not in _bare:
+                        try:
+                            from harness.models.combo import ComboManager as _CM
+                            _cand = None
+                            try:
+                                _cand = _CM().get_combo(_bare)
+                            except Exception:
+                                _cand = None
+                            if _cand is not None:
+                                _combo_name_to_run = _bare
+                        except Exception:
+                            pass
+        if _combo_name_to_run is not None:
+            from harness.models.combo import ComboManager, ComboProvider
+            try:
+                _mgr = ComboManager()
+                _cdef = _mgr.get_combo(_combo_name_to_run)
+            except Exception:
+                _cdef = None
+            if not _cdef:
+                raise ProviderError(f"Combo '{_combo_name_to_run}' not found.")
+            _cprov = ComboProvider(_combo_name_to_run, _cdef, gateway_config=self.config)
+            return _cprov.chat(messages, tools)
 
         # ---- Resolve provider + model_name from 'provider/model' string ----
         # Whitespace-tolerant: split "/" then strip each segment.
@@ -482,8 +524,93 @@ class LLMGateway:
         if isinstance(target_provider_name, str):
             target_provider_name = target_provider_name.strip() or target_provider_name
 
+        # ---- Combo-member isolation (R2): member calls use empty chain ----
+        _combo_isolated = False
+        _combo_active_name: Optional[str] = None
+        _combo_member_id: Optional[str] = None
+        try:
+            _def_cfg = getattr(self.config, "default", "")
+            _def_cfg = _def_cfg.strip() if isinstance(_def_cfg, str) else _def_cfg
+            if _def_cfg == "combo" and isinstance(model, str) and model.strip():
+                _active_raw = getattr(self.config, "active_model", None)
+                if _active_raw is None:
+                    _active_raw = self.active_model
+                _active_combo: Optional[str] = None
+                if isinstance(_active_raw, str) and _active_raw.strip():
+                    _a = _active_raw.strip()
+                    if "/" in _a:
+                        try:
+                            _al, _ar = (p.strip() for p in _a.split("/", 1))
+                        except Exception:
+                            _al, _ar = "", ""
+                        if _al == "combo" and _ar:
+                            _active_combo = _ar
+                    else:
+                        if _a and _a != "combo":
+                            _active_combo = _a
+                if _active_combo:
+                    try:
+                        from harness.models.combo import ComboManager as _CM2
+                        try:
+                            _cdef2 = _CM2().get_combo(_active_combo)
+                        except Exception:
+                            _cdef2 = None
+                    except Exception:
+                        _cdef2 = None
+                    if isinstance(_cdef2, dict):
+                        try:
+                            _members = _cdef2.get("models", []) or []
+                        except Exception:
+                            _members = []
+                        try:
+                            _m_norm = model.strip()
+                        except Exception:
+                            _m_norm = None
+                        if isinstance(_m_norm, str) and _m_norm:
+                            try:
+                                for _m in _members:
+                                    if isinstance(_m, str) and _m.strip() == _m_norm:
+                                        _combo_isolated = True
+                                        _combo_active_name = _active_combo
+                                        _combo_member_id = _m_norm
+                                        break
+                            except Exception:
+                                pass
+        except Exception:
+            _combo_isolated = False
+
         # Build the failover chain: target provider first, then configured failovers
-        providers_to_try = self._build_failover_chain(target_provider_name)
+        # Combo paths never leak to global failover (empty chain, single attempt).
+        if _combo_isolated:
+            providers_to_try = [target_provider_name]
+        else:
+            try:
+                _targ_norm = target_provider_name.strip() if isinstance(target_provider_name, str) else target_provider_name
+            except Exception:
+                _targ_norm = target_provider_name
+            if _targ_norm == "combo":
+                if isinstance(target_model_name, str) and target_model_name.strip():
+                    _tn = target_model_name.strip()
+                    try:
+                        from harness.models.combo import ComboManager as _CM3
+                        try:
+                            _chk = _CM3().get_combo(_tn)
+                        except Exception:
+                            _chk = None
+                    except Exception:
+                        _chk = None
+                    if _chk is not None:
+                        from harness.models.combo import ComboManager as _CM4, ComboProvider as _CP4
+                        try:
+                            _cdef4 = _CM4().get_combo(_tn)
+                        except Exception:
+                            _cdef4 = None
+                        if _cdef4:
+                            _cprov4 = _CP4(_tn, _cdef4, gateway_config=self.config)
+                            return _cprov4.chat(messages, tools)
+                    raise ProviderError(f"Combo '{_tn}' not found.")
+                raise ProviderError("Combo provider requires a combo name as model (e.g. combo/my_combo).")
+            providers_to_try = self._build_failover_chain(target_provider_name)
 
         last_error: Optional[Exception] = None
         target_error: Optional[Exception] = None
@@ -522,7 +649,13 @@ class LLMGateway:
 
                     # Inject active model into provider before calling (restored after)
                     if target_model_name:
-                        self._apply_active_model(provider, target_model_name)
+                        if _combo_isolated:
+                            try:
+                                self._apply_active_model(provider, target_model_name, _allow_global_effort=False)
+                            except TypeError:
+                                self._apply_active_model(provider, target_model_name)
+                        else:
+                            self._apply_active_model(provider, target_model_name)
 
                     effective_tools = tools
                     try:
@@ -584,7 +717,7 @@ class LLMGateway:
                         raise ProviderError(
                             f"Provider '{target_provider_name}' failed for model "
                             f"'{target_model_name or '<default>'}': {e} "
-                            f"Run '/login {target_provider_name}' or '/model' to switch."
+                             f"Run '/provider {target_provider_name}' or '/model' to switch."
                         ) from e
                     logger.debug(f"Provider '{_pn}' non-recoverable error: {e}")
                     attempts.append(f"{_pn}: {e}")
@@ -613,12 +746,45 @@ class LLMGateway:
                         raise ProviderError(
                             f"Provider '{target_provider_name}' failed for model "
                             f"'{target_model_name or '<default>'}': {e} "
-                            f"Run '/login {target_provider_name}' or '/model' to switch."
+                             f"Run '/provider {target_provider_name}' or '/model' to switch."
                         ) from e
                     logger.debug(f"Provider '{_pn}' unexpected error: {e}")
                     attempts.append(f"{_pn}: {e}")
                     continue
 
+        if _combo_isolated:
+            _usable: Optional[Exception] = None
+            if target_error is not None and not _is_unavailable_error(target_error):
+                _usable = target_error
+            else:
+                for _, _e in ordered:
+                    if not _is_unavailable_error(_e):
+                        _usable = _e
+                        break
+            _base = _usable if _usable is not None else (
+                target_error if target_error is not None else last_error
+            )
+            if _base is not None and _is_auth_error(_base):
+                _hint = f"Run '/provider {target_provider_name}' to re-authenticate, or '/model' to switch."
+            elif _base is not None and (_is_connection_error(_base) or _is_timeout_error(_base)):
+                _hint = f"Check connection for '{target_provider_name}' or run '/model' to switch provider."
+            else:
+                _hint = "Run '/model' to switch provider or '/providers' to see options."
+            if attempts:
+                _chain = " | ".join(attempts)
+                if _base is not None:
+                    _detail = f"Last error: {_base}. Attempts: {_chain}."
+                else:
+                    _detail = f"Attempts: {_chain}."
+            else:
+                _detail = f"Last error: {_base}."
+            if "/help" not in _hint:
+                _hint = _hint + " Run '/help' for more options."
+            raise ProviderError(
+                f"Combo '{_combo_active_name}' member '{_combo_member_id}' failed "
+                f"(provider '{target_provider_name}' model '{target_model_name or '<default>'}'). "
+                f"{_detail} {_hint}"
+            ) from _base
         if explicit_target:
             # Prefer the first usable (non-skipped) error so an unavailable
             # failover (e.g. ollama not installed) never masks the original
@@ -635,7 +801,7 @@ class LLMGateway:
                 target_error if target_error is not None else last_error
             )
             if _base is not None and _is_auth_error(_base):
-                _hint = f"Run '/login {target_provider_name}' to re-authenticate, or '/model' to switch."
+                _hint = f"Run '/provider {target_provider_name}' to re-authenticate, or '/model' to switch."
             elif _base is not None and (_is_connection_error(_base) or _is_timeout_error(_base)):
                 _hint = f"Check connection for '{target_provider_name}' or run '/model' to switch provider."
             else:

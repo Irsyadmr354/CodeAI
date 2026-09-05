@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import random
@@ -112,15 +113,226 @@ class ComboProvider(BaseProvider):
         # Store config so _get_gateway can instantiate a valid LLMGateway
         self._gateway_config = gateway_config
 
-    def _get_gateway(self):
-        """Create a fresh LLMGateway using stored config, or build a minimal default."""
+    def _get_gateway(self, model_id: Optional[str] = None):
+        """Create a fresh LLMGateway using stored config, or build a minimal default.
+
+        Member isolation: the returned gateway is built from a copy of the
+        stored config whose failover is emptied (failover_order=[] and
+        fallbackChains={}). No-op when the config structure is unsupported
+        (returns legacy behaviour instead). Never crashes here.
+        """
         from harness.models.gateway import LLMGateway
+        try:
+            isolated = self._isolated_config()
+            if isolated is not None:
+                try:
+                    return LLMGateway(isolated)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         if self._gateway_config is not None:
-            return LLMGateway(self._gateway_config)
+            try:
+                return LLMGateway(self._gateway_config)
+            except Exception:
+                pass
         # Fallback: build a minimal config so the gateway doesn't crash
         from harness.config import ProviderConfig
         default_config = ProviderConfig()
         return LLMGateway(default_config)
+
+    def _isolated_config(self) -> Optional[Any]:
+        """Copy stored config with empty failover (isolation).
+
+        Returns None when the structure is unsupported so the caller can
+        fall back to legacy behaviour. Never raises.
+        """
+        base = self._gateway_config
+        try:
+            if base is None:
+                try:
+                    from harness.config import ProviderConfig
+                    return ProviderConfig(failover_order=[])
+                except Exception:
+                    return None
+            if hasattr(base, "model_copy"):
+                try:
+                    iso = base.model_copy(deep=True)
+                except Exception:
+                    try:
+                        iso = copy.deepcopy(base)
+                    except Exception:
+                        return None
+                try:
+                    if hasattr(iso, "failover_order"):
+                        iso.failover_order = []  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                for _k in ("fallbackChains", "fallback_chains"):
+                    try:
+                        if hasattr(iso, _k):
+                            setattr(iso, _k, {})
+                    except Exception:
+                        pass
+                try:
+                    _extra = getattr(iso, "model_extra", None)
+                    if isinstance(_extra, dict):
+                        for _k in ("fallbackChains", "fallback_chains"):
+                            if _k in _extra:
+                                try:
+                                    _extra[_k] = {}
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+                try:
+                    _prov = getattr(iso, "provider", None)
+                    if _prov is not None and hasattr(_prov, "failover_order"):
+                        try:
+                            _prov.failover_order = []  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+                    try:
+                        _pextra = getattr(_prov, "model_extra", None)
+                        if isinstance(_pextra, dict):
+                            for _k in ("fallbackChains", "fallback_chains"):
+                                if _k in _pextra:
+                                    try:
+                                        _pextra[_k] = {}
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                return iso
+            if isinstance(base, dict):
+                try:
+                    iso_d = copy.deepcopy(base)
+                except Exception:
+                    return None
+                try:
+                    if "failover_order" in iso_d:
+                        iso_d["failover_order"] = []
+                    for _k in ("fallbackChains", "fallback_chains"):
+                        if _k in iso_d:
+                            iso_d[_k] = {}
+                    _p = iso_d.get("provider")
+                    if isinstance(_p, dict):
+                        if "failover_order" in _p:
+                            _p["failover_order"] = []
+                        for _k in ("fallbackChains", "fallback_chains"):
+                            if _k in _p:
+                                _p[_k] = {}
+                except Exception:
+                    pass
+                return iso_d
+            try:
+                iso_o = copy.copy(base)
+            except Exception:
+                return None
+            try:
+                if hasattr(iso_o, "failover_order"):
+                    try:
+                        setattr(iso_o, "failover_order", [])
+                    except Exception:
+                        pass
+                for _k in ("fallbackChains", "fallback_chains"):
+                    try:
+                        if hasattr(iso_o, _k):
+                            setattr(iso_o, _k, {})
+                    except Exception:
+                        pass
+                try:
+                    _prov2 = getattr(iso_o, "provider", None)
+                    if _prov2 is not None and hasattr(_prov2, "failover_order"):
+                        try:
+                            setattr(_prov2, "failover_order", [])
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            except Exception:
+                return None
+            return iso_o
+        except Exception:
+            return None
+
+    def _default_provider_name(self) -> str:
+        try:
+            cfg = self._gateway_config
+            if cfg is not None:
+                _d = getattr(cfg, "default", None)
+                if isinstance(_d, str) and _d.strip():
+                    return _d.strip()
+                _prov = getattr(cfg, "provider", None)
+                if _prov is not None:
+                    _d2 = getattr(_prov, "default", None)
+                    if isinstance(_d2, str) and _d2.strip():
+                        return _d2.strip()
+                if isinstance(cfg, dict):
+                    _d3 = cfg.get("default")
+                    if isinstance(_d3, str) and _d3.strip():
+                        return _d3.strip()
+                    _p = cfg.get("provider")
+                    if isinstance(_p, dict):
+                        _d4 = _p.get("default")
+                        if isinstance(_d4, str) and _d4.strip():
+                            return _d4.strip()
+        except Exception:
+            pass
+        return "unknown"
+
+    @staticmethod
+    def _split_member_id(model_id: Any, default_provider: str = "unknown") -> Any:
+        try:
+            _s = str(model_id or "").strip()
+        except Exception:
+            _s = ""
+        _dp = default_provider if isinstance(default_provider, str) and default_provider.strip() else "unknown"
+        _dp = _dp.strip()
+        if not _s:
+            return (_dp, "")
+        if "/" in _s:
+            _a, _b = _s.split("/", 1)
+            _a = _a.strip()
+            _b = _b.strip()
+            if _a and _b:
+                return (_a, _b)
+            _bare = _b or _a or _s
+            _prov = _a if _a else _dp
+            return (_prov if _prov else _dp, _bare)
+        return (_dp, _s)
+
+    def _with_serving(self, result: Any, model_id: str) -> Any:
+        try:
+            if not isinstance(result, dict):
+                return result
+            try:
+                _defprov = self._default_provider_name()
+            except Exception:
+                _defprov = "unknown"
+            try:
+                _sp, _sm = self._split_member_id(model_id, _defprov)
+            except Exception:
+                return result
+            if not _sp or not _sm:
+                return result
+            try:
+                tagged = dict(result)
+            except Exception:
+                return result
+            try:
+                tagged["serving_provider"] = _sp
+                tagged["serving_model"] = _sm
+            except Exception:
+                pass
+            return tagged
+        except Exception:
+            try:
+                return result
+            except Exception:
+                return result
 
     def _call_model(
         self,
@@ -129,7 +341,31 @@ class ComboProvider(BaseProvider):
         messages: List[Dict[str, str]],
         tools: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        return gateway.chat(messages, model=model_id, tools=tools)
+        res = gateway.chat(messages, model=model_id, tools=tools)
+        try:
+            return self._with_serving(res, model_id)
+        except Exception:
+            return res
+
+    def _call_member(
+        self,
+        model_id: str,
+        messages: List[Dict[str, str]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Fresh isolated gateway per member, then tagged call (never crash on gateway build)."""
+        try:
+            _gw = self._get_gateway(model_id)
+        except Exception:
+            _gw = None
+        if _gw is None:
+            try:
+                _gw = self._get_gateway()
+            except Exception:
+                _gw = None
+        if _gw is None:
+            raise RuntimeError("Unable to build gateway for combo member.")
+        return self._call_model(_gw, model_id, messages, tools)
 
     def chat(
         self,
@@ -145,22 +381,20 @@ class ComboProvider(BaseProvider):
                 "Call a tool-capable provider directly instead."
             )
 
-        gateway = self._get_gateway()
-
         if self.strategy == ComboStrategy.ROUND_ROBIN:
             with self._lock:
                 model = self.models[self._round_robin_index % len(self.models)]
                 self._round_robin_index += 1
-            return self._call_model(gateway, model, messages, tools)
+            return self._call_member(model, messages, tools)
 
         elif self.strategy == ComboStrategy.RANDOM:
             model = random.choice(self.models)
-            return self._call_model(gateway, model, messages, tools)
+            return self._call_member(model, messages, tools)
 
         elif self.strategy == ComboStrategy.FASTEST:
             with ThreadPoolExecutor(max_workers=len(self.models)) as executor:
                 futures = {
-                    executor.submit(self._call_model, gateway, m, messages, tools): m
+                    executor.submit(self._call_member, m, messages, tools): m
                     for m in self.models
                 }
                 try:
@@ -175,6 +409,12 @@ class ComboProvider(BaseProvider):
                             for f in futures:
                                 if not f.done():
                                     f.cancel()
+                            try:
+                                _win = futures.get(future)
+                                if isinstance(result, dict) and _win:
+                                    result = self._with_serving(result, _win)
+                            except Exception:
+                                pass
                             return result
                 except (FuturesTimeoutError, TimeoutError):
                     pass
@@ -184,39 +424,57 @@ class ComboProvider(BaseProvider):
             last_error = None
             for model in self.models:
                 try:
-                    return self._call_model(gateway, model, messages, tools)
+                    return self._call_member(model, messages, tools)
                 except Exception as e:
                     last_error = e
                     continue
             raise RuntimeError(f"All models failed in cascade strategy. Last error: {last_error}")
 
         elif self.strategy == ComboStrategy.CONSENSUS:
-            responses = []
+            responses: List[Any] = []
             with ThreadPoolExecutor(max_workers=len(self.models)) as executor:
-                futures = [
-                    executor.submit(self._call_model, gateway, m, messages, tools)
+                futures_map = {
+                    executor.submit(self._call_member, m, messages, tools): m
                     for m in self.models
-                ]
+                }
                 try:
-                    for future in as_completed(futures, timeout=_CONSENSUS_TIMEOUT_S):
+                    for future in as_completed(futures_map, timeout=_CONSENSUS_TIMEOUT_S):
                         try:
-                            responses.append(future.result(timeout=_CONSENSUS_TIMEOUT_S))
+                            _res = future.result(timeout=_CONSENSUS_TIMEOUT_S)
                         except (FuturesTimeoutError, TimeoutError):
                             pass
                         except Exception:
                             pass
+                        else:
+                            try:
+                                _m = futures_map.get(future, "")
+                            except Exception:
+                                _m = ""
+                            responses.append((_m, _res))
                 except (FuturesTimeoutError, TimeoutError):
                     pass
             if not responses:
                 raise RuntimeError("All models failed in consensus strategy.")
             # Heuristic: return the longest response as best candidate
-            return max(responses, key=lambda r: len(r.get("content") or ""))
+            def _clen(t: Any) -> int:
+                try:
+                    _r = t[1]
+                    if isinstance(_r, dict):
+                        return len(_r.get("content") or "")
+                except Exception:
+                    pass
+                return 0
+            _best_m, _best_r = max(responses, key=_clen)
+            try:
+                return self._with_serving(_best_r, _best_m)
+            except Exception:
+                return _best_r
 
         elif self.strategy == ComboStrategy.COST_OPTIMIZER:
             # Models ordered cheapest-first by convention
             for model in self.models:
                 try:
-                    return self._call_model(gateway, model, messages, tools)
+                    return self._call_member(model, messages, tools)
                 except Exception:
                     continue
             raise RuntimeError("All models failed in cost_optimizer strategy.")
@@ -224,28 +482,28 @@ class ComboProvider(BaseProvider):
         elif self.strategy == ComboStrategy.WEIGHTED_RANDOM:
             weights = self.params.get("weights", [1] * len(self.models))
             model = random.choices(self.models, weights=weights, k=1)[0]
-            return self._call_model(gateway, model, messages, tools)
+            return self._call_member(model, messages, tools)
 
         elif self.strategy == ComboStrategy.AB_SPLIT:
             model = self.models[0] if random.random() < 0.5 else self.models[1 % len(self.models)]
-            return self._call_model(gateway, model, messages, tools)
+            return self._call_member(model, messages, tools)
 
         elif self.strategy == ComboStrategy.PIPELINE:
             if len(self.models) < 2:
                 raise ValueError("Pipeline strategy needs at least 2 models.")
-            draft = self._call_model(gateway, self.models[0], messages, tools)
+            draft = self._call_member(self.models[0], messages, tools)
             refine_messages = list(messages) + [
-                {"role": "assistant", "content": draft.get("content", "")},
+                {"role": "assistant", "content": draft.get("content", "") if isinstance(draft, dict) else ""},
                 {"role": "user", "content": "Refine and improve this response."},
             ]
-            return self._call_model(gateway, self.models[1], refine_messages, tools)
+            return self._call_member(self.models[1], refine_messages, tools)
 
         elif self.strategy == ComboStrategy.QUALITY_TIER:
             try:
-                return self._call_model(gateway, self.models[0], messages, tools)
+                return self._call_member(self.models[0], messages, tools)
             except Exception:
                 if len(self.models) > 1:
-                    return self._call_model(gateway, self.models[1], messages, tools)
+                    return self._call_member(self.models[1], messages, tools)
                 raise
 
         elif self.strategy == ComboStrategy.LOAD_BALANCER:
@@ -260,14 +518,17 @@ class ComboProvider(BaseProvider):
                         best_model = m
 
             start = time.time()
-            res = self._call_model(gateway, best_model, messages, tools)
+            res = self._call_member(best_model, messages, tools)
             duration = time.time() - start
             with self._lock:
                 self._load_times.setdefault(best_model, []).append(duration)
                 # Keep only last 10 measurements
                 if len(self._load_times[best_model]) > 10:
                     self._load_times[best_model].pop(0)
-            return res
+            try:
+                return self._with_serving(res, best_model)
+            except Exception:
+                return res
 
         else:
             raise ValueError(f"Unknown combo strategy: {self.strategy}")

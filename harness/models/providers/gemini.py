@@ -91,7 +91,7 @@ class GeminiProvider(BaseProvider):
                     active_access_token = token
 
             if not active_api_key and not active_access_token:
-                raise ProviderError("GEMINI_API_KEY is not set and no Gemini OAuth token found. Run '/login gemini'")
+                raise ProviderError("GEMINI_API_KEY is not set and no Gemini OAuth token found. Run '/provider gemini'")
 
         # If active_api_key exists (starts with AIza): Execute via Generative Language REST API
         if active_api_key:
@@ -203,16 +203,17 @@ class GeminiProvider(BaseProvider):
             if proc.returncode != 0:
                 err_msg = (proc.stderr or proc.stdout or "").strip()
                 if "is not recognized as a known model" in err_msg:
-                    fallback_model = "gemini-3.7-flash-low"
-                    fallback_cmd = ["agy", "--print", prompt_text, "--model", fallback_model, "--disable-slash-commands"]
-                    proc = subprocess.run(fallback_cmd, capture_output=True, text=True, timeout=60)
+                    raise ProviderError(
+                        f"Unknown Gemini model '{self.model}' is not recognized as a known model.\n"
+                        "Instructions: Use '/model' to select a valid Gemini model."
+                    )
 
                 if proc.returncode != 0:
                     err_msg = (proc.stderr or proc.stdout or "").strip()
                     raise ProviderError(
                         f"Antigravity CLI ('agy') execution failed (exit code {proc.returncode}): {err_msg}\n"
                         "Instructions: Verify Antigravity CLI authentication ('agy') or provide a Google AI Studio API Key "
-                        "via '/login gemini' (Option 1)."
+                        "via '/provider gemini' (Option 1)."
                     )
 
             raw_output = proc.stdout or ""
@@ -229,7 +230,7 @@ class GeminiProvider(BaseProvider):
             raise ProviderError(
                 "Antigravity CLI ('agy') was not found in PATH.\n"
                 "Instructions: Please install Antigravity CLI ('agy') or provide a Google AI Studio API Key "
-                "via '/login gemini' (Option 1)."
+                "via '/provider gemini' (Option 1)."
             )
         except subprocess.TimeoutExpired:
             raise TimeoutError("Antigravity CLI ('agy') inference timed out after 60s.")

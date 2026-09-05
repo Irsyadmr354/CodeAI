@@ -1456,6 +1456,11 @@ class CodeAICLI:
                     console.print(Markdown(str(_content)))
                 except Exception:
                     console.print(str(_content))
+                try:
+                    if str(provider or "").strip().lower() == "combo":
+                        self._combo_footer(model, result)
+                except Exception:
+                    pass
         elif RICH_AVAILABLE:
             # Rich ada tapi Live/Spinner tak tersedia → Status statis (legacy).
             # Worker sudah jalan di atas; tinggal tunggu (jangan run ulang).
@@ -1489,6 +1494,11 @@ class CodeAICLI:
                     console.print(Markdown(str(_content2)))
                 except Exception:
                     console.print(str(_content2))
+                try:
+                    if str(provider or "").strip().lower() == "combo":
+                        self._combo_footer(model, result)
+                except Exception:
+                    pass
         else:
             # Non-rich: ticker elapsed via \r + token mengalir inline (flush).
             # Label provider PENUH + model short.
@@ -1569,6 +1579,11 @@ class CodeAICLI:
             elif _shown["n"] > 0:
                 # Jawaban sudah mengalir live → cukup footer elapsed.
                 print(f"\n─ {provider} ◆ · {short} · {dt:.1f}s ─ (selesai)")
+                try:
+                    if str(provider or "").strip().lower() == "combo":
+                        self._combo_footer(model, result)
+                except Exception:
+                    pass
             else:
                 try:
                     _c3b = result.get("content", "") if isinstance(result, dict) else str(result)
@@ -1585,6 +1600,11 @@ class CodeAICLI:
                 except Exception:
                     pass
                 print(f"\n─ {provider} ◆ · {short} · {dt:.1f}s ─")
+                try:
+                    if str(provider or "").strip().lower() == "combo":
+                        self._combo_footer(model, result)
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # _auth_provider (internal auth, via /provider)
@@ -2915,8 +2935,16 @@ class CodeAICLI:
                     print(f"  {name}{_mark} [{data['strategy']}]: {', '.join(data['models'])}")
                 print()
 
+        elif _cmd == "use":
+            self._combo_use(_rest)
+            return
+        elif _cmd == "edit":
+            self._combo_edit(_rest)
+            return
         elif _cmd == "remove":
             _name = _rest.strip()
+            if _name.lower().startswith("combo/"):
+                _name = _name.split("/", 1)[1].strip()
             if not _name:
                 _print("[yellow]Usage: /combo remove <nama>[/yellow]")
                 return
@@ -2976,7 +3004,278 @@ class CodeAICLI:
             if sw.strip().lower() == "y":
                 self.switch_model(f"combo/{name}")
         else:
-            _print("[yellow]Usage: /combo [list|create|remove <nama>][/yellow] [dim](type /help)[/dim]")
+            _print("[yellow]Usage: /combo [list|create|use|edit|remove][/yellow] [dim]/combo use <nama> · /combo edit <nama> · /combo remove <nama> (type /help)[/dim]")
+
+    def _combo_use(self, name_arg: str = "") -> None:
+        """Aktifkan combo via jalur switch yang sudah ada (setara /model combo/<nama>)."""
+        from harness.models.combo import ComboManager
+        manager = ComboManager()
+        try:
+            combos = manager.list_combos() or {}
+        except Exception:
+            combos = {}
+        _name = (name_arg or "").strip()
+        if _name.lower().startswith("combo/"):
+            _name = _name.split("/", 1)[1].strip()
+        if not _name:
+            if not combos:
+                _print("[yellow]No combos saved.[/yellow] [dim](buat via /combo create)[/dim]")
+                return
+            items = sorted(combos.keys())
+            def _show(n):
+                try:
+                    _d = combos.get(n) or {}
+                    return f"{n} [{_d.get('strategy', '?')}] — {', '.join(_d.get('models', []) or [])}"
+                except Exception:
+                    return str(n)
+            _pick = self._tui_pick("Combo — pakai", items, show=_show, initial="")
+            if _pick is None:
+                _print("[dim]Dibatalkan.[/dim]")
+                return
+            _name = items[_pick]
+        try:
+            _def = manager.get_combo(_name)
+        except Exception:
+            _def = None
+        if not _def:
+            try:
+                for _k in list(combos.keys()):
+                    if isinstance(_k, str) and _k.strip().lower() == _name.strip().lower():
+                        _name = _k
+                        _def = manager.get_combo(_k)
+                        break
+            except Exception:
+                pass
+        if not _def:
+            _print(f"[red]Combo '{_name}' tidak ditemukan.[/red] [dim](lihat /combo list)[/dim]")
+            return
+        try:
+            self.switch_model(f"combo/{_name}")
+        except Exception as _e:
+            _print(f"[red]Gagal pakai combo '{_name}': {_e}[/red]")
+
+    def _combo_edit(self, name_arg: str = "") -> None:
+        """Ubah strategi + tambah/buang models, simpan overwrite (nama tetap)."""
+        from harness.models.combo import ComboManager, ComboStrategy
+        manager = ComboManager()
+        try:
+            combos = manager.list_combos() or {}
+        except Exception:
+            combos = {}
+        _name = (name_arg or "").strip()
+        if _name.lower().startswith("combo/"):
+            _name = _name.split("/", 1)[1].strip()
+        if not _name:
+            if not combos:
+                _print("[yellow]No combos saved.[/yellow] [dim](buat via /combo create)[/dim]")
+                return
+            items = sorted(combos.keys())
+            def _show2(n):
+                try:
+                    _d = combos.get(n) or {}
+                    return f"{n} [{_d.get('strategy', '?')}] — {', '.join(_d.get('models', []) or [])}"
+                except Exception:
+                    return str(n)
+            _pick0 = self._tui_pick("Combo — edit", items, show=_show2, initial="")
+            if _pick0 is None:
+                _print("[dim]Dibatalkan.[/dim]")
+                return
+            _name = items[_pick0]
+        try:
+            _cur = manager.get_combo(_name)
+        except Exception:
+            _cur = None
+        _canon = _name
+        if not _cur:
+            try:
+                for _k in list(combos.keys()):
+                    if isinstance(_k, str) and _k.strip().lower() == _name.strip().lower():
+                        _canon = _k
+                        _cur = manager.get_combo(_k)
+                        break
+            except Exception:
+                pass
+        if not isinstance(_cur, dict):
+            _print(f"[red]Combo '{_name}' tidak ditemukan.[/red] [dim](lihat /combo list)[/dim]")
+            return
+        try:
+            _cur_strategy = str(_cur.get("strategy", "") or "")
+        except Exception:
+            _cur_strategy = ""
+        try:
+            _cur_models = list(_cur.get("models", []) or [])
+        except Exception:
+            _cur_models = []
+        try:
+            _cur_params = dict(_cur.get("params", {}) or {})
+        except Exception:
+            _cur_params = {}
+        strategies = [s.value for s in ComboStrategy]
+        def _sshow(s):
+            try:
+                return f"{s} ★ saat ini" if s == _cur_strategy else s
+            except Exception:
+                return s
+        _spick = self._tui_pick("Combo — strategi (baru)", strategies, show=_sshow, initial=_cur_strategy or "")
+        if _spick is None:
+            _print("[dim]Dibatalkan.[/dim]")
+            return
+        new_strategy = strategies[_spick]
+        connected = self._list_connected_fast()
+        if not connected:
+            _print("[yellow]No connected providers. Run /provider first.[/yellow]")
+            return
+        try:
+            _cur_txt = ", ".join(_cur_models) if _cur_models else "—"
+        except Exception:
+            _cur_txt = "—"
+        _mpicks = self._tui_pick_multi(f"Combo — models (saat ini: {_cur_txt})", connected, show=lambda m: m["id"], initial="")
+        if not _mpicks:
+            _print("[dim]Dibatalkan.[/dim]")
+            return
+        new_models = [connected[i]["id"] for i in _mpicks]
+        try:
+            manager.create_combo(_canon, new_strategy, new_models, params=_cur_params)
+        except TypeError:
+            try:
+                manager.create_combo(_canon, new_strategy, new_models)
+            except Exception as _e:
+                _print(f"[red]Gagal simpan combo: {_e}[/red]")
+                return
+        except Exception as _e:
+            _print(f"[red]Gagal simpan combo: {_e}[/red]")
+            return
+        _print(f"[bold green]✅ Combo '{_canon}' diperbarui.[/bold green] [dim]({new_strategy} · {len(new_models)} models · pakai via /combo use {_canon})[/dim]")
+
+    @staticmethod
+    def _combo_extract_serving(result):
+        """Cari info member penyaji di response dict (varian keys). Return (prov, model) atau (None, None)."""
+        try:
+            if not isinstance(result, dict):
+                return None, None
+            def _g(*keys):
+                for _k in keys:
+                    try:
+                        if _k in result and result[_k]:
+                            _v = result[_k]
+                            if isinstance(_v, str) and _v.strip():
+                                return _v.strip()
+                            elif isinstance(_v, dict):
+                                return _v
+                            elif _v:
+                                return _v
+                    except Exception:
+                        continue
+                try:
+                    _low = {str(k).lower(): v for k, v in result.items()}
+                    for _k in keys:
+                        _lk = str(_k).lower()
+                        if _lk in _low and _low[_lk]:
+                            _v = _low[_lk]
+                            if isinstance(_v, str) and _v.strip():
+                                return _v.strip()
+                            elif isinstance(_v, dict):
+                                return _v
+                            elif _v:
+                                return _v
+                except Exception:
+                    pass
+                return None
+            _sp = _g("serving_provider", "served_provider", "member_provider")
+            _sm = _g("serving_model", "served_model", "member_model")
+            if isinstance(_sp, str) and isinstance(_sm, str) and _sp.strip() and _sm.strip():
+                return _sp.strip(), _sm.strip()
+            _srv = _g("serving", "served_by", "serving_member")
+            if isinstance(_srv, dict):
+                try:
+                    _p = _srv.get("provider") or _srv.get("serving_provider") or _srv.get("member_provider")
+                    _m = _srv.get("model") or _srv.get("serving_model") or _srv.get("member") or _srv.get("member_model")
+                    if _p and _m:
+                        return str(_p).strip(), str(_m).strip()
+                    if _m and "/" in str(_m):
+                        _a, _b = str(_m).split("/", 1)
+                        if _a.strip() and _b.strip():
+                            return _a.strip(), _b.strip()
+                except Exception:
+                    pass
+            elif isinstance(_srv, str) and _srv.strip():
+                _s = _srv.strip()
+                if "/" in _s:
+                    _a, _b = _s.split("/", 1)
+                    if _a.strip() and _b.strip():
+                        return _a.strip(), _b.strip()
+            _mem = _g("member", "member_id")
+            if isinstance(_mem, str) and _mem.strip():
+                _s = _mem.strip()
+                if "/" in _s:
+                    _a, _b = _s.split("/", 1)
+                    if _a.strip() and _b.strip():
+                        return _a.strip(), _b.strip()
+                _p2 = _g("provider", "member_provider", "serving_provider")
+                if isinstance(_p2, str) and _p2.strip() and _s:
+                    return _p2.strip(), _s
+            elif isinstance(_mem, dict):
+                try:
+                    _p = _mem.get("provider") or _mem.get("serving_provider")
+                    _m = _mem.get("model") or _mem.get("serving_model") or _mem.get("id")
+                    if _p and _m:
+                        return str(_p).strip(), str(_m).strip()
+                except Exception:
+                    pass
+            try:
+                if "provider" in result and "model" in result:
+                    _p = str(result.get("provider") or "").strip()
+                    _m = str(result.get("model") or "").strip()
+                    if _p and _m and "/" not in _p:
+                        return _p, _m
+            except Exception:
+                pass
+            return None, None
+        except Exception:
+            return None, None
+
+    def _combo_footer(self, combo_name: str, result) -> None:
+        """Footer tiap respons combo. Fallback strategi+member bila serving tak diekspos (combo.py tak disentuh)."""
+        try:
+            _cn = str(combo_name or "").strip()
+        except Exception:
+            _cn = str(combo_name)
+        try:
+            if "/" in _cn:
+                _cn = _cn.split("/", 1)[1].strip() or _cn
+        except Exception:
+            pass
+        if not _cn:
+            return
+        try:
+            _sp, _sm = self._combo_extract_serving(result)
+        except Exception:
+            _sp, _sm = None, None
+        if _sp and _sm:
+            _print(f"[dim]dilayani oleh combo {_cn} → {_sp}/{_sm} member aktual[/dim]")
+            return
+        try:
+            from harness.models.combo import ComboManager as _CM2
+            _def = _CM2().get_combo(_cn)
+        except Exception:
+            _def = None
+        if isinstance(_def, dict):
+            try:
+                _strat = str(_def.get("strategy", "?") or "?")
+            except Exception:
+                _strat = "?"
+            try:
+                _mems = list(_def.get("models", []) or [])
+            except Exception:
+                _mems = []
+            _mem_txt = ", ".join(_mems) if _mems else "—"
+            _print(f"[dim]dilayani oleh combo {_cn} [{_strat}] · member: {_mem_txt} (serving member tak diekspos provider)[/dim]")
+        else:
+            _print(f"[dim]dilayani oleh combo {_cn} (detail combo tak ditemukan)[/dim]")
+        try:
+            logging.getLogger(__name__).warning("Handoff next-wave: ComboProvider tak mengekspos serving member (butuh serving_provider/serving_model di return dict) — lihat harness/models/combo.py:ComboProvider.chat")
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # /history
@@ -3107,7 +3406,7 @@ class CodeAICLI:
         groups = [
             ("Model", [("/model (/m)", "Switch — fuzzy query direct or selector; base-effort inline"),
                        ("/effort (/e)", "Show/set Antigravity effort (persisted)"),
-                       ("/combo (/c)", "Manage combos [list|create|remove <nama>]")]),
+                       ("/combo (/c)", "Manage combos [list|create|use|edit|remove]")]),
             ("Auth", [("/provider [id]", "Authenticate/switch provider"),
                       ("/providers (/p)", "List providers + status"),
                       ("/provider add|list|remove", "Manage custom providers"),
