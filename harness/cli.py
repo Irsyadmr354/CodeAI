@@ -2304,11 +2304,13 @@ class CodeAICLI:
         _print(f"[bold green]✅ Provider '{_pid}' tersimpan.[/bold green] [dim]({len(_models)} models)[/dim]")
         try:
             if _models:
-                self._ask_switch_provider(_pid, _models[0])
+                self._set_active_provider(_pid, _models[0])
+                _print(f"✅ {_pid}/{_models[0]} aktif — langsung bisa chat.")
             else:
-                _print(f"[dim]Run /model { _pid}/<nama> setelah discovery, atau /provider list untuk cek.[/dim]")
+                self._set_active_provider(_pid, "")
+                _print(f"✅ {_pid}/ aktif — langsung bisa chat. [dim]Run /model {_pid}/<nama> setelah discovery, atau /provider list untuk cek.[/dim]")
         except Exception:
-            _print(f"[dim]Tersimpan. Gunakan /model { _pid}/<nama> untuk switch.[/dim]")
+            _print(f"[dim]Tersimpan. Gunakan /model {_pid}/<nama> untuk switch.[/dim]")
 
     def _provider_list(self) -> None:
         try:
