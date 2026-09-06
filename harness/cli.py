@@ -40,6 +40,67 @@ from harness.core.hooks import HooksDispatcher
 from harness.rules.agents_parser import AgentsParser
 from harness.core.allowance import AllowanceGuard
 
+# TUI baru (stdlib saja): teks via render_*, interaksi via run_*/pick_*,
+# galat via error_box, kaki via footer_*. Fallback None agar tetap importable.
+try:
+    from harness.tui.components import error_box, footer_petunjuk
+except Exception:  # pragma: no cover
+    error_box = None  # type: ignore
+    footer_petunjuk = None  # type: ignore
+try:
+    from harness.tui.pickers import pick_single, pick_multi
+except Exception:  # pragma: no cover
+    pick_single = None  # type: ignore
+    pick_multi = None  # type: ignore
+try:
+    from harness.tui.screens_model import (
+        render_model_list,
+        render_model_detail,
+        suggest_models,
+        run_model_read,
+        run_model_use,
+    )
+except Exception:  # pragma: no cover
+    render_model_list = None  # type: ignore
+    render_model_detail = None  # type: ignore
+    suggest_models = None  # type: ignore
+    run_model_read = None  # type: ignore
+    run_model_use = None  # type: ignore
+try:
+    from harness.tui.screens_provider import (
+        render_provider_list,
+        render_provider_detail,
+        suggest_providers,
+        validate_base_url,
+        test_koneksi,
+        run_provider_read,
+    )
+except Exception:  # pragma: no cover
+    render_provider_list = None  # type: ignore
+    render_provider_detail = None  # type: ignore
+    suggest_providers = None  # type: ignore
+    validate_base_url = None  # type: ignore
+    test_koneksi = None  # type: ignore
+    run_provider_read = None  # type: ignore
+try:
+    from harness.tui.screens_combo import (
+        render_daftar,
+        render_detail,
+        footer_combo,
+        flow_create,
+        flow_edit,
+        flow_remove,
+        flow_use,
+    )
+except Exception:  # pragma: no cover
+    render_daftar = None  # type: ignore
+    render_detail = None  # type: ignore
+    footer_combo = None  # type: ignore
+    flow_create = None  # type: ignore
+    flow_edit = None  # type: ignore
+    flow_remove = None  # type: ignore
+    flow_use = None  # type: ignore
+
 PROVIDER_DEFAULT_MODELS = {
     "anthropic": lambda: os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20240620"),
     "openai":    lambda: os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
@@ -68,57 +129,11 @@ def _rule(title="", style="dim"):
 
 
 # ---------------------------------------------------------------------------
-# TUI picker fullscreen (STDLIB ONLY: termios/tty/select/sys)
+# TUI picker via screens (harness/tui/pickers.py) — stdlib saja.
+# Jalur render inline lama dihapus; satu-satunya jalur interaksi adalah
+# pick_single/pick_multi dari screens.
+# _tui_setraw dipertahankan karena dipakai ulang oleh harness/tui/pickers.py.
 # ---------------------------------------------------------------------------
-
-def _tui_filter(items, query, show=None):
-    """Logika murni (tanpa TTY): filter substring case-insensitive.
-
-    Return list[(orig_idx, item)] agar mapping ke `items` utuh.
-    Query kosong → semua item.
-    """
-    _show = show if callable(show) else (lambda x: x)  # noqa: E731
-
-    def _label(it):
-        try:
-            return str(_show(it))
-        except Exception:
-            return str(it)
-
-    q = (query or "").strip().lower()
-    if not q:
-        return list(enumerate(items or []))
-    out = []
-    for i, it in enumerate(items or []):
-        try:
-            if q in _label(it).lower():
-                out.append((i, it))
-        except Exception:
-            continue
-    return out
-
-
-def _tui_move(idx, n, key):
-    """Logika murni (tanpa TTY): gerak highlight wrap-around.
-
-    key: 'up'/'down' (panah), 'j'/'k' (vim), 'home'/'end'. Lainnya → tetap.
-    """
-    if n <= 0:
-        return 0
-    try:
-        idx = int(idx) % n
-    except Exception:
-        idx = 0
-    k = (key or "").strip().lower()
-    if k == "home":
-        return 0
-    if k == "end":
-        return n - 1
-    if k in ("up", "k", "ctrl-p"):
-        return (idx - 1) % n
-    if k in ("down", "j", "ctrl-n"):
-        return (idx + 1) % n
-    return idx
 
 
 def _tui_setraw(fd, when=None):
@@ -141,386 +156,6 @@ def _tui_setraw(fd, when=None):
     new[6][termios.VMIN] = 1
     new[6][termios.VTIME] = 0
     termios.tcsetattr(fd, when, new)
-
-
-class _TUIPicker:
-    """Picker fullscreen interaktif (raw termios) + simulasi key-sequence.
-
-    Interaktif: panah ↑↓ / j/k pindah, huruf filter live, Spasi toggle ✓
-    (multi), Enter pilih, Esc/q/Ctrl-C batal (None, JANGAN switch). Tiap
-    refresh clear screen ANSI (`\\x1b[2J\\x1b[H`); termios SELALU direstore
-    di finally (bahkan saat exception). Non-TTY → pemanggil fallback ke
-    _popup_pick line-based. Simulasi: pick(keys=[...]) tanpa TTY — token
-    'up'/'down'/'enter'/'esc'/'q'/'backspace'/'space'/'ctrl-c'/'j'/'k',
-    1 huruf biasa (j/k/q = navigasi/batal), atau string >1 huruf = ketik
-    harfiah per huruf (termasuk j/k/q sebagai query).
-    """
-
-    VIEWPORT = 15
-    FOOTER = "Cara pakai: ketik untuk mencari · tombol atas bawah untuk pindah · Enter untuk pilih · Esc untuk batal"
-
-    def __init__(self, title="", items=None, show=None, initial="", multi=False, initial_selected=None, selected=None, initial_index=None):
-        self.title = title or "Pilih"
-        self.items = list(items) if items else []
-        self.show = show if callable(show) else (lambda x: x)  # noqa: E731
-        self.query = (initial or "").strip()
-        self.multi = bool(multi)
-        self.idx = 0
-        self.selected: List[int] = []
-        self._scroll = 0
-        try:
-            _pre = initial_selected if initial_selected is not None else selected
-            if _pre is not None:
-                _n = len(self.items)
-                _seen = set()
-                _out: List[int] = []
-                for _v in list(_pre or []):
-                    try:
-                        _oi = int(_v)
-                    except Exception:
-                        continue
-                    if 0 <= _oi < _n and _oi not in _seen:
-                        _seen.add(_oi)
-                        _out.append(_oi)
-                self.selected = _out
-        except Exception:
-            self.selected = []
-        try:
-            if initial_index is not None:
-                _ii = int(initial_index)
-                _total = len(self.filtered())
-                if _total > 0:
-                    if _ii < 0:
-                        _ii = 0
-                    if _ii >= _total:
-                        _ii = _total - 1
-                    self.idx = _ii
-                    self._scroll = 0
-                    self._viewport(_total)
-        except Exception:
-            pass
-
-    def label(self, it) -> str:
-        try:
-            return str(self.show(it))
-        except Exception:
-            return str(it)
-
-    def filtered(self):
-        return _tui_filter(self.items, self.query, self.show)
-
-    @staticmethod
-    def available() -> bool:
-        try:
-            if not sys.stdin.isatty() or not sys.stdout.isatty():
-                return False
-            import termios  # noqa: F401
-            import tty  # noqa: F401
-            import select  # noqa: F401
-            return True
-        except Exception:
-            return False
-
-    def _viewport(self, total: int) -> int:
-        vs = self.VIEWPORT
-        if total <= 0:
-            self._scroll = 0
-            return 0
-        if self.idx >= total:
-            self.idx = total - 1
-        if self.idx < 0:
-            self.idx = 0
-        sc = self._scroll
-        if self.idx < sc:
-            sc = self.idx
-        elif self.idx >= sc + vs:
-            sc = self.idx - vs + 1
-        sc = max(0, min(sc, max(0, total - vs)))
-        self._scroll = sc
-        return sc
-
-    def _lines(self):
-        # VERTIKAL murni: 1 item = 1 baris, TANPA Columns/Table/wrap.
-        # baris1 judul+posisi, baris2 query, lalu viewport, lalu footer.
-        import shutil
-        try:
-            _tw = int(shutil.get_terminal_size(fallback=(80, 24)).columns)
-        except Exception:
-            _tw = 80
-        if _tw < 20:
-            _tw = 80
-        _max = max(20, min(_tw, 100) - 4)
-
-        def _trunc(s: str, budget: int) -> str:
-            t = str(s).replace("\r", " ").replace("\n", " ")
-            if len(t) <= budget:
-                return t
-            if budget <= 1:
-                return t[:budget]
-            return t[: budget - 1] + "…"
-
-        filt = self.filtered()
-        total = len(filt)
-        sc = self._viewport(total)
-        pos = f"▶ {self.idx + 1}/{total}" if total else "▶ 0/0"
-        lines = [_trunc(f"{self.title}  {pos}", _max), _trunc(f"Cari: {self.query}▊", _max)]
-        for r in range(sc, min(sc + self.VIEWPORT, total)):
-            oi, it = filt[r]
-            raw = str(self.label(it)).replace("\r", " ").replace("\n", " ")
-            mark = ("✓ " if oi in self.selected else "  ") if self.multi else ""
-            pre = "▶ " if r == self.idx else "  "
-            num = f"{r + 1:2}. "
-            budget = _max - len(pre) - len(num) - len(mark)
-            if budget < 1:
-                budget = 1
-            lab = _trunc(raw, budget)
-            if r == self.idx:
-                lines.append(f"\x1b[7m{pre}{num}{mark}{lab}\x1b[0m")
-            else:
-                lines.append(f"{pre}{num}{mark}{lab}")
-        if total == 0:
-            lines.append(_trunc(f"  ✗ tidak cocok: '{self.query}' — coba kata lain, contoh: gemini", _max))
-        if self.multi:
-            lines.append(_trunc(f"  [terpilih {len(self.selected)} terhitung · Spasi=Tandai · Enter=Selesai (min 1)]", _max))
-        # Footer Cara pakai JANGAN dipotong agar frasa baku utuh di semua lebar terminal.
-        lines.append(self.FOOTER if not self.multi else self.FOOTER + " · Spasi=Tandai")
-        return lines
-
-    def _render(self) -> None:
-        # Fullscreen refresh: clear + hide kursor, SATU write per baris via join+\n.
-        try:
-            sys.stdout.write("\x1b[2J\x1b[H")
-            sys.stdout.write("\x1b[?25l")
-            sys.stdout.write("\n".join(self._lines()))
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-        except Exception:
-            pass
-
-    @staticmethod
-    def parse_key_sequence(seq: str) -> str:
-        """Pure parser sekuens-key -> token (unit-testable, tanpa TTY).
-
-        seq: raw string (mis. "\x1b", "\x1b[A", "\x1b[B", "\x1b[C",
-        "\x1b[D", "\x1b[H", "\x1b[F", "\x1bOA", "\r", "j", ...).
-        Return: up/down/left/right/home/end/enter/backspace/ctrl-c/space/
-        esc/j/k/q/single-char/unknown. CSI tak dikenal -> unknown
-        (JANGAN esc agar tak batal).
-        """
-        if not seq:
-            return "esc"
-        if seq in ("\r", "\n"):
-            return "enter"
-        if seq in ("\x7f", "\x08"):
-            return "backspace"
-        if seq in ("\x03", "\x04"):
-            return "ctrl-c"
-        if seq == " ":
-            return "space"
-        if seq == "\x1b":
-            return "esc"
-        if seq.startswith("\x1b[") or seq.startswith("\x1bO"):
-            if len(seq) < 3:
-                return "unknown"
-            final = seq[-1]
-            if final == "A":
-                return "up"
-            if final == "B":
-                return "down"
-            if final == "C":
-                return "right"
-            if final == "D":
-                return "left"
-            if final in ("H",):
-                return "home"
-            if final in ("F",):
-                return "end"
-            if final == "~":
-                try:
-                    _num = seq[2:-1].split(";")[0].strip()
-                    if _num in ("1", "7"):
-                        return "home"
-                    if _num in ("4", "8"):
-                        return "end"
-                except Exception:
-                    pass
-                return "unknown"
-            return "unknown"
-        if len(seq) == 1 and seq.lower() in ("j", "k", "q"):
-            return seq.lower()
-        if len(seq) == 1 and (seq.isprintable() or ord(seq) > 127):
-            return seq
-        return "unknown"
-
-    def _read_key(self) -> str:
-        import select
-        ch = sys.stdin.read(1)
-        if not ch:
-            return "esc"
-        if ch != "\x1b":
-            if ch in ("\r", "\n"):
-                return "enter"
-            if ch in ("\x7f", "\x08"):
-                return "backspace"
-            if ch in ("\x03", "\x04"):
-                return "ctrl-c"
-            if ch == " ":
-                return "space"
-            if len(ch) == 1 and ch.lower() in ("j", "k", "q"):
-                return ch.lower()
-            if len(ch) == 1 and (ch.isprintable() or ord(ch) > 127):
-                return ch
-            return "unknown"
-        r, _, _ = select.select([sys.stdin], [], [], 0.08)
-        if not r:
-            return "esc"
-        ch2 = sys.stdin.read(1)
-        if not ch2:
-            return "esc"
-        if ch2 not in ("[", "O"):
-            return "esc"
-        seq = ch + ch2
-        for _ in range(8):
-            r2, _, _ = select.select([sys.stdin], [], [], 0.08)
-            if not r2:
-                break
-            chN = sys.stdin.read(1)
-            if not chN:
-                break
-            seq += chN
-            if chN.isalpha() or chN == "~":
-                break
-        return self.parse_key_sequence(seq)
-
-    def _handle_key(self, key):
-        """Return 'select'/'cancel'/None. Mutasi query/idx/selected."""
-        filt = self.filtered()
-        total = len(filt)
-        if key in ("up", "down", "home", "end"):
-            if total:
-                self.idx = _tui_move(self.idx, total, key)
-            return None
-        if key in ("left", "right", "unknown"):
-            return None
-        if isinstance(key, str) and key in ("j", "k"):
-            if total:
-                self.idx = _tui_move(self.idx, total, key)
-            return None
-        if key in ("esc", "q", "ctrl-c"):
-            return "cancel"
-        if key == "backspace":
-            if self.query:
-                self.query = self.query[:-1]
-                self.idx = 0
-                self._scroll = 0
-            return None
-        if key == "enter":
-            if not total:
-                return "cancel"
-            if self.multi:
-                if self.selected:
-                    return "select"
-                # Minimal 1: highlight ikut tersimpan agar Enter selalu ≥1.
-                self.selected = [filt[min(self.idx, total - 1)][0]]
-                return "select"
-            return "select"
-        if key == "space":
-            if self.multi:
-                if total:
-                    oi = filt[min(self.idx, total - 1)][0]
-                    if oi in self.selected:
-                        self.selected.remove(oi)
-                    else:
-                        self.selected.append(oi)
-                return None
-            self.query += " "
-            self.idx = 0
-            self._scroll = 0
-            return None
-        if isinstance(key, str) and len(key) == 1 and (key.isprintable() or ord(key) > 127):
-            self.query += key
-            self.idx = 0
-            self._scroll = 0
-            return None
-        return None
-
-    def _result(self):
-        filt = self.filtered()
-        if self.multi:
-            return list(self.selected) if self.selected else None
-        if not filt:
-            return None
-        return filt[min(self.idx, len(filt) - 1)][0]
-
-    def _run_keys(self, keys):
-        for tok in keys or []:
-            if tok is None:
-                continue
-            t = tok if isinstance(tok, str) else str(tok)
-            tl = t.lower()
-            if tl in ("up", "down", "enter", "esc", "backspace", "space", "ctrl-c"):
-                act = self._handle_key(tl)
-            elif len(t) == 1:
-                if t == " ":
-                    act = self._handle_key("space")
-                elif tl in ("j", "k", "q"):
-                    act = self._handle_key(tl)
-                else:
-                    self.query += t
-                    self.idx = 0
-                    self._scroll = 0
-                    continue
-            else:
-                # Token >1 huruf = ketik harfiah per huruf (j/k/q = query).
-                for ch in t:
-                    self.query += ch
-                self.idx = 0
-                self._scroll = 0
-                continue
-            if act == "select":
-                return self._result()
-            if act == "cancel":
-                return None
-        return None
-
-    def pick(self, keys=None):
-        """Interaktif raw-TTY, atau simulasi bila `keys` diisi (tanpa TTY)."""
-        if keys is not None:
-            return self._run_keys(list(keys))
-        import termios
-        import tty
-        fd = sys.stdin.fileno()
-        try:
-            old = termios.tcgetattr(fd)
-        except Exception:
-            old = None
-        try:
-            if old is not None:
-                _tui_setraw(fd)
-            try:
-                sys.stdout.write("\x1b[?25l")
-                sys.stdout.flush()
-            except Exception:
-                pass
-            while True:
-                self._render()
-                key = self._read_key()
-                act = self._handle_key(key)
-                if act == "select":
-                    return self._result()
-                if act == "cancel":
-                    return None
-        finally:
-            if old is not None:
-                try:
-                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
-                except Exception:
-                    pass
-            try:
-                sys.stdout.write("\x1b[?25h\x1b[0m\n")
-                sys.stdout.flush()
-            except Exception:
-                pass
 
 
 # ---------------------------------------------------------------------------
@@ -802,8 +437,46 @@ class CodeAICLI:
         except Exception:
             return ["anthropic"]
 
+    def _render_error_box(self, judul: str, sebab: str = "", langkah=None) -> str:
+        """Galat via screens error_box (saran hanya perintah valid)."""
+        try:
+            _steps = list(langkah) if langkah else []
+        except Exception:
+            _steps = []
+        try:
+            _fn = globals().get("error_box")
+            if callable(_fn):
+                return str(_fn(judul, sebab, _steps))
+        except Exception:
+            pass
+        # Fallback manual (tetap valid, tanpa perintah tak ada).
+        try:
+            _j = str(judul or "").strip() or "Terjadi kesalahan"
+            _s = str(sebab or "").strip()
+            _b = [f"\u2717 {_j}"]
+            if _s and _s.lower() != _j.lower():
+                _b.append(f"Sebab: {_s}")
+            _bersih = []
+            _seen = set()
+            for _it in _steps:
+                _t = str(_it or "").strip()
+                if not _t or _t.lower() in _seen:
+                    continue
+                _seen.add(_t.lower())
+                _bersih.append(_t)
+            if _bersih:
+                _b.append("Langkah:")
+                for _n, _t in enumerate(_bersih, 1):
+                    _b.append(f"  {_n}. {_t}")
+            return "\n".join(_b)
+        except Exception:
+            return str(judul)
+
     def _format_task_error(self, provider: str, model: str, err_text: str) -> str:
-        # Render rantai penuh per baris (ringkas), saran hanya CONNECTED.
+        # Sebab + rantai dihitung seperti semula (bisnis tetap), render via error_box.
+        # Saran VALID saja: /model /provider /combo /bantuan. JANGAN sarankan
+        # perintah tak ada. Combo bukan penyedia sehingga tak pernah disarankan
+        # via /provider.
         try:
             raw = str(err_text or "")
         except Exception:
@@ -812,12 +485,10 @@ class CodeAICLI:
             low = raw.lower()
         except Exception:
             low = ""
-        # Ekstrak sebab terakhir (last error) satu baris ≤120 char.
         try:
             _cause = raw
             if "last error:" in low:
                 _cause = raw[low.rfind("last error:") + len("last error:"):].strip().rstrip(".").strip()
-                # Buang hint trailing "run '/provider...'" bila menempel.
                 _ll = _cause.lower()
                 _cut = _ll.find("run '/provider")
                 if _cut > 20:
@@ -827,7 +498,6 @@ class CodeAICLI:
                     if _cut2 > 20:
                         _cause = _cause[:_cut2].strip().rstrip(".").strip()
             elif "failed for model" in low:
-                # "Provider 'x' failed for model 'y': <sebab> Run '...'"
                 _idx = raw.find(": ", raw.lower().find("failed for model"))
                 if _idx != -1:
                     _tail = raw[_idx + 2:].strip()
@@ -843,7 +513,7 @@ class CodeAICLI:
                         _cause = _tail
             _cause = " ".join(str(_cause).split())
             if len(_cause) > 120:
-                _cause = _cause[:119] + "…"
+                _cause = _cause[:119] + "\u2026"
             if not _cause:
                 _cause = "gagal"
         except Exception:
@@ -858,298 +528,118 @@ class CodeAICLI:
             connected = self._connected_ids_for_suggest()
         except Exception:
             connected = []
+        # Saring combo dari saran penyedia (combo dipakai via /model atau /combo).
         try:
-            conn_set = set(connected or [])
+            _chain_saring = [str(_x).strip() for _x in (chain or []) if str(_x or "").strip() and str(_x).strip() != "combo"]
         except Exception:
-            conn_set = set()
-        # Pemilik sebab: explicit-target → provider; "all configured..." → akhir rantai.
+            _chain_saring = []
         try:
-            _is_all = "all configured providers failed" in low
-            _owner = chain[-1] if _is_all and chain else provider
+            _conn_saring = [str(_x).strip() for _x in (connected or []) if str(_x or "").strip() and str(_x).strip() != "combo"]
         except Exception:
-            _owner = provider
-        try:
-            _oll_inst = self._ollama_installed()
-        except Exception:
-            _oll_inst = False
-        _oll_run = None
-        if _oll_inst:
-            try:
-                _oll_run = self._ollama_running(timeout=1.0)
-            except Exception:
-                _oll_run = False
-        else:
-            _oll_run = False
-        lines: list = []
-        lines.append("Gagal menjawab")
+            _conn_saring = []
         try:
             _sebab = str(_cause or "").strip() or "tidak ada rincian"
         except Exception:
             _sebab = "tidak ada rincian"
-        lines.append(f"Sebab: {_sebab}")
-        for _pid in chain:
-            try:
-                _ps = str(_pid).strip() or "?"
-            except Exception:
-                _ps = "?"
-            if _ps == "ollama":
-                if not _oll_inst:
-                    lines.append("• ollama: dilewati (belum dipasang)")
-                elif not _oll_run:
-                    lines.append("• ollama: dilewati (belum jalan — jalankan `ollama serve`)")
-                elif _ps == _owner:
-                    if self._is_auth_like(_cause):
-                        lines.append(f"• ollama: {_cause} → saran /provider ollama")
-                    elif self._is_conn_like(_cause):
-                        lines.append(f"• ollama: {_cause} → periksa sambungan atau /model")
-                    else:
-                        lines.append(f"• ollama: {_cause}")
+        # Langkah valid saja (maks 5 ID per baris, tanpa daftar member).
+        _langkah: list = []
+        try:
+            if _conn_saring:
+                _tampil = ", ".join(list(_conn_saring)[:5])
+                if _tampil:
+                    _langkah.append(f"ketik /model untuk memilih model yang Terhubung, contoh: /model {_tampil.split(',')[0].strip()}")
                 else:
-                    lines.append("• ollama: dicoba (cadangan)")
-                continue
-            if _ps not in conn_set:
-                lines.append(f"• {_ps}: belum terhubung → saran /provider {_ps}")
-            elif _ps == _owner:
-                if self._is_auth_like(_cause):
-                    lines.append(f"• {_ps}: {_cause} → saran /provider {_ps}")
-                elif self._is_conn_like(_cause):
-                    lines.append(f"• {_ps}: {_cause} → periksa sambungan atau /model")
-                else:
-                    lines.append(f"• {_ps}: {_cause}")
+                    _langkah.append("ketik /model untuk memilih model yang Terhubung, contoh: /model gemini")
+                _langkah.append("ketik /provider untuk menyambung, contoh: /provider gemini")
+                _langkah.append("ketik /combo untuk gabungan, contoh: /combo list")
             else:
-                lines.append(f"• {_ps}: dicoba (cadangan)")
-        if connected:
-            try:
-                _show = ", ".join(list(connected)[:5])
-                lines.append(f"Saran: /model {_show} (hanya yang Terhubung) · /providers (/daftar) untuk daftar")
-            except Exception:
-                pass
-        else:
-            lines.append("Saran: /provider untuk menyambung (lihat /providers atau /daftar)")
-        lines.append("Langkah 1: ketik /provider untuk menyambung, contoh: /provider gemini")
-        lines.append("Langkah 2: ketik /model untuk memilih model yang Terhubung, contoh: /model gemini")
-        lines.append("Langkah 3: ulangi pertanyaan Anda, contoh: halo")
-        return "\n".join(lines)
+                _langkah.append("ketik /provider untuk menyambung, contoh: /provider gemini")
+                _langkah.append("ketik /model untuk memilih model yang Terhubung, contoh: /model gemini")
+                _langkah.append("ketik /combo untuk gabungan, contoh: /combo list")
+            _langkah.append("ulangi pertanyaan Anda, contoh: halo")
+            _langkah.append("ketik /bantuan untuk bantuan")
+        except Exception:
+            _langkah = ["ketik /provider untuk menyambung, contoh: /provider gemini", "ketik /bantuan untuk bantuan"]
+        try:
+            return self._render_error_box("Gagal menjawab", _sebab, _langkah)
+        except Exception:
+            return f"\u2717 Gagal menjawab\nSebab: {_sebab}"
 
     # ------------------------------------------------------------------
-    # Popup + search bar (generik, stdlib only, rich-optional)
-    # ------------------------------------------------------------------
-
-    def _popup_render(self, title: str, query: str, shown: list, total: int) -> None:
-        """Render satu ronde popup — SATU item SATU baris vertikal, TANPA Table/Columns/wrap."""
-        import shutil
-        try:
-            _tw = int(shutil.get_terminal_size(fallback=(80, 24)).columns)
-        except Exception:
-            _tw = 80
-        if _tw < 20:
-            _tw = 80
-        _max = max(20, min(_tw, 100) - 4)
-
-        def _trunc(s: str, budget: int) -> str:
-            t = str(s).replace("\r", " ").replace("\n", " ")
-            if len(t) <= budget:
-                return t
-            if budget <= 1:
-                return t[:budget]
-            return t[: budget - 1] + "…"
-
-        footer = "Cara pakai: ketik untuk mencari · tombol atas bawah untuk pindah · Enter untuk pilih · Esc untuk batal"
-        count_line = f"… +{total - len(shown)} cocok (ketik lagi untuk menyaring, contoh: gemini)" if total > len(shown) else ""
-        # Plain vertical writes (no Rich Table/Panel/Columns → anti-menyamping).
-        try:
-            sys.stdout.write(_trunc(f"── {title}", _max) + "\n")
-            sys.stdout.write(_trunc(f"Cari: {query if query else '—'}", _max) + "\n")
-            for i, label in enumerate(shown, 1):
-                pre = f"{i:2}. "
-                budget = _max - len(pre)
-                if budget < 1:
-                    budget = 1
-                sys.stdout.write(pre + _trunc(label, budget) + "\n")
-            if count_line:
-                sys.stdout.write(_trunc(count_line, _max) + "\n")
-            # Footer Cara pakai JANGAN dipotong agar frasa baku utuh.
-            sys.stdout.write(footer + "\n")
-            sys.stdout.flush()
-        except Exception:
-            pass
-
-    def _popup_input(self, hint: str = "[Cari:] nomor/teks (Enter=batal, q=batal)") -> Optional[str]:
-        # stdlib input() untuk kedua mode (rich hanya untuk render) agar
-        # mudah di-mock via builtins.input pada pengujian.
-        try:
-            return input(f"{hint}: ")
-        except (EOFError, KeyboardInterrupt):
-            return None
-
-    def _popup_pick(self, title: str, items: list, show: Optional[Callable] = None, initial: str = "") -> Optional[int]:
-        """Popup generik + search bar. Return index ke `items` atau None (batal).
-
-        LOOP refine: teks → filter substring case-insensitive → render ulang;
-        nomor valid → return; Enter kosong → batal (None, JANGAN switch); q → batal.
-        """
-        if show is None:
-            show = lambda x: x  # noqa: E731
-        if not items:
-            _print("[dim]Tidak ada pilihan.[/dim]")
-            return None
-
-        def _labels(it):
-            try:
-                return str(show(it))
-            except Exception:
-                return str(it)
-
-        def _filtered(q: str):
-            q = (q or "").strip()
-            if not q:
-                return list(enumerate(items))
-            ql = q.lower()
-            return [(i, it) for i, it in enumerate(items) if ql in _labels(it).lower()]
-
-        query = (initial or "").strip()
-        filt = _filtered(query)
-        while True:
-            total = len(filt)
-            visible_pairs = filt[:15]
-            shown = [_labels(it) for _, it in visible_pairs]
-            if total == 0:
-                # Tetap render popup + pesan tolak (verbatim untuk simulasi).
-                self._popup_render(title, query, [], 0)
-                _print(f"[red]✗ tidak cocok: '{query}'[/red] [dim]coba kata kunci lain, contoh: gemini / q=batal[/dim]")
-            else:
-                self._popup_render(title, query, shown, total)
-            raw = self._popup_input()
-            if raw is None:
-                return None
-            s = (raw or "").strip()
-            if not s:
-                return None
-            if s.lower() == "q":
-                return None
-            if s.isdigit():
-                n = int(s)
-                if 1 <= n <= total:
-                    return visible_pairs[n - 1][0] if n <= len(visible_pairs) else filt[n - 1][0]
-                _print(f"[red]Nomor di luar 1..{total}[/red] [dim](Enter=batal)[/dim]")
-                continue
-            # teks → filter ulang
-            query = s
-            filt = _filtered(query)
-            continue
-
-    def _popup_pick_multi(self, title: str, items: list, show: Optional[Callable] = None, initial: str = "", initial_selected=None, selected=None) -> Optional[List[int]]:
-        """Varian multi-pilih: `1,3` tambah/cabut, substring=filter, `done` selesai."""
-        if show is None:
-            show = lambda x: x  # noqa: E731
-        if not items:
-            return None
-
-        def _labels(it):
-            try:
-                return str(show(it))
-            except Exception:
-                return str(it)
-
-        def _filtered(q: str):
-            q = (q or "").strip()
-            if not q:
-                return list(enumerate(items))
-            ql = q.lower()
-            return [(i, it) for i, it in enumerate(items) if ql in _labels(it).lower()]
-
-        def _show_with_mark(it, oi, selected):
-            mark = "✓ " if oi in selected else "  "
-            return f"{mark}{_labels(it)}"
-
-        selected: List[int] = []
-        try:
-            _pre = initial_selected if initial_selected is not None else selected
-            if _pre is not None:
-                _n = len(items or [])
-                _seen = set()
-                _out: List[int] = []
-                for _v in list(_pre or []):
-                    try:
-                        _oi = int(_v)
-                    except Exception:
-                        continue
-                    if 0 <= _oi < _n and _oi not in _seen:
-                        _seen.add(_oi)
-                        _out.append(_oi)
-                selected = _out
-        except Exception:
-            selected = []
-        query = (initial or "").strip()
-        filt = _filtered(query)
-        hint = "[Cari:] 1,3/selesai/teks (Enter=Selesai/batal, q=batal)"
-        while True:
-            total = len(filt)
-            visible_pairs = filt[:15]
-            shown = [_show_with_mark(it, oi, selected) for oi, it in visible_pairs]
-            sel_info = f"terpilih {len(selected)}" if selected else "belum ada yang dipilih"
-            self._popup_render(f"{title} · {sel_info}", query, shown, total)
-            raw = self._popup_input(hint)
-            if raw is None:
-                return selected if selected else None
-            s = (raw or "").strip()
-            if not s:
-                return selected if selected else None
-            if s.lower() == "q":
-                return None
-            if s.lower() in ("done", "selesai"):
-                return selected if selected else None
-            parts = [p.strip() for p in s.split(",")]
-            if parts and all(p.isdigit() for p in parts):
-                ok = True
-                for p in parts:
-                    n = int(p)
-                    if 1 <= n <= total:
-                        oi = (visible_pairs[n - 1][0] if n <= len(visible_pairs) else filt[n - 1][0])
-                        if oi in selected:
-                            selected.remove(oi)
-                        else:
-                            selected.append(oi)
-                    else:
-                        _print(f"[red]Nomor di luar 1..{total}: {p}[/red]")
-                        ok = False
-                        break
-                _print(f"[dim]terpilih {len(selected)}[/dim]")
-                continue
-            query = s
-            filt = _filtered(query)
-            continue
-
-    # ------------------------------------------------------------------
-    # TUI pick (fullscreen bila TTY, fallback popup line-based)
+    # TUI pick via screens (satu-satunya jalur interaksi)
     # ------------------------------------------------------------------
 
     def _tui_pick(self, title: str, items: list, show: Optional[Callable] = None,
                   initial: str = "", multi: bool = False, _keys=None, initial_selected=None, selected=None, initial_index=None):
-        """Pilih via _TUIPicker fullscreen; fallback _popup_pick bila non-TTY.
+        """Pilih via screens pick_single/pick_multi (stdlib, tanpa jalur ganda).
 
-        single → Optional[int] (index `items`); multi=True → Optional[List[int]].
-        Esc/q/Enter-kosong → None (JANGAN switch). `_keys` hanya injeksi uji.
+        single -> Optional[int]; multi=True -> Optional[List[int]].
+        Esc/q/Enter-kosong -> None (JANGAN switch). `_keys` injeksi uji.
         """
         if show is None:
             show = lambda x: x  # noqa: E731
         if not items:
             _print("[dim]Tidak ada pilihan.[/dim]")
-            return None
+            return None if not multi else []
+        # Simulasi tanpa TTY (uji): pakai _Picker screens agar query awal dihormati.
         if _keys is not None:
-            return _TUIPicker(title, items, show=show, initial=initial, multi=multi, initial_selected=initial_selected, selected=selected, initial_index=initial_index).pick(keys=_keys)
-        if _TUIPicker.available():
             try:
-                return _TUIPicker(title, items, show=show, initial=initial, multi=multi, initial_selected=initial_selected, selected=selected, initial_index=initial_index).pick()
-            except Exception as e:
-                logging.getLogger(__name__).warning(f"TUI picker gagal, fallback popup: {e}")
-        if multi:
-            return self._popup_pick_multi(title, items, show=show, initial=initial, initial_selected=initial_selected, selected=selected)
-        return self._popup_pick(title, items, show=show, initial=initial)
+                from harness.tui.pickers import _Picker as _ScreensPicker
+                _pre = (initial_selected if initial_selected is not None else selected) if multi else None
+                _pk = _ScreensPicker(judul=title, items=items, show=show, query=(initial or ""), multi=bool(multi), initial_selected=_pre)
+                try:
+                    if (not multi) and initial_index is not None:
+                        _filt = _pk.filtered()
+                        _tot = len(_filt)
+                        if _tot > 0:
+                            _ii = int(initial_index)
+                            _pk.idx = max(0, min(_ii, _tot - 1))
+                except Exception:
+                    pass
+                _hasil = _pk.run_keys(list(_keys))
+                if multi:
+                    return list(_hasil) if _hasil is not None else []
+                return _hasil
+            except Exception:
+                pass
+            try:
+                if multi:
+                    _fnm = globals().get("pick_multi")
+                    if callable(_fnm):
+                        try:
+                            return _fnm(title, items, show=show, initial_selected=(initial_selected if initial_selected is not None else selected), keys=list(_keys))
+                        except TypeError:
+                            return _fnm(title, items, show=show, keys=list(_keys))
+                    return []
+                _fns = globals().get("pick_single")
+                if callable(_fns):
+                    return _fns(title, items, show=show, keys=list(_keys))
+            except Exception:
+                pass
+            return None if not multi else []
+        # Interaktif: delegasi penuh ke screens.
+        try:
+            if multi:
+                _fnm2 = globals().get("pick_multi")
+                if callable(_fnm2):
+                    try:
+                        return _fnm2(title, items, show=show, initial_selected=(initial_selected if initial_selected is not None else selected))
+                    except TypeError:
+                        return _fnm2(title, items, show=show)
+                return []
+            _fns2 = globals().get("pick_single")
+            if callable(_fns2):
+                return _fns2(title, items, show=show)
+        except Exception as e:
+            try:
+                logging.getLogger(__name__).warning(f"TUI picker gagal: {e}")
+            except Exception:
+                pass
+        return None if not multi else []
 
     def _tui_pick_multi(self, title: str, items: list, show: Optional[Callable] = None,
                         initial: str = "", _keys=None, initial_selected=None, selected=None) -> Optional[List[int]]:
-        """Multi-pilih: Spasi toggle ✓, Enter selesai (min 1), Esc/q batal."""
+        """Multi-pilih via screens pick_multi (Spasi tandai, Enter selesai)."""
         return self._tui_pick(title, items, show=show, initial=initial, multi=True, _keys=_keys, initial_selected=initial_selected, selected=selected)
 
     # ------------------------------------------------------------------
@@ -1368,9 +858,7 @@ class CodeAICLI:
             "/steer":     lambda: self.steer_orchestrator(args) if args else _print("[yellow]Cara pakai: /steer (/alih) <perintah>[/yellow] [dim]Contoh: /steer lanjutkan[/dim]"),
             "/st":        lambda: self.steer_orchestrator(args) if args else _print("[yellow]Cara pakai: /steer (/alih) <perintah>[/yellow] [dim]Contoh: /steer lanjutkan[/dim]"),
             "/alih":      lambda: self.steer_orchestrator(args) if args else _print("[yellow]Cara pakai: /alih (/steer) <perintah>[/yellow] [dim]Contoh: /alih lanjutkan[/dim]"),
-            "/providers": lambda: self.show_providers(args),
             "/p":         lambda: self.show_providers(args),
-            "/daftar":    lambda: self.show_providers(args),
             "/provider":  lambda: self.handle_provider(args),
             "/models":    lambda: self.show_models(args) if args else _print("[yellow]Cara pakai: /models <penyedia>[/yellow] [dim]Contoh: /models gemini[/dim]"),
             "/model":     lambda: self.switch_model(args),
@@ -2394,7 +1882,7 @@ class CodeAICLI:
             _print(f"[dim]Tersimpan. Masih memakai {current_provider}. Jalankan /model untuk pindah kapan saja. Contoh: /model gemini[/dim]")
 
     # ------------------------------------------------------------------
-    # /providers
+    # Daftar penyedia (via screens)
     # ------------------------------------------------------------------
 
     def show_providers(self, filter_q: str = ""):
@@ -2402,30 +1890,58 @@ class CodeAICLI:
         q = (filter_q or "").strip().lower()
         if q:
             providers = [p for p in providers if q in p["id"].lower() or q in str(p.get("name", "")).lower()]
+        # Perkaya jumlah model via registry (bisnis tetap, tampil via screens).
+        try:
+            _reg = self._registry()
+        except Exception:
+            _reg = None
+        _diperkaya: list = []
+        for _p in providers or []:
+            try:
+                _pid = str(_p.get("id", "")).strip()
+                if not _pid:
+                    continue
+                _ent = dict(_p)
+                try:
+                    _ml = _reg.list_models(_pid) if _reg is not None and hasattr(_reg, "list_models") else []
+                    _ent["models"] = list(_ml) if isinstance(_ml, list) else []
+                except Exception:
+                    _ent.setdefault("models", [])
+                _diperkaya.append(_ent)
+            except Exception:
+                continue
+        try:
+            _fn = globals().get("render_provider_list")
+            if callable(_fn):
+                _teks = str(_fn(_diperkaya))
+                _print(_teks)
+                return
+        except Exception:
+            pass
+        try:
+            _fn2 = globals().get("run_provider_read")
+            if callable(_fn2):
+                _fn2(_diperkaya, out=_print)
+                return
+        except Exception:
+            pass
+        # Fallback manual (tanpa perintah tak ada, tanpa Table ganda).
         try:
             _st0, _lbl0, _pos0 = self._status_baku()
         except Exception:
             _st0, _lbl0, _pos0 = ("○ Belum terhubung", "belum ada model", "Langkah 1: ketik /provider")
-
-        if RICH_AVAILABLE:
-            table = Table(title=f"Penyedia Cari: {filter_q.strip() if filter_q.strip() else '—'} — {_st0} — {_lbl0} — {_pos0}", show_header=True, header_style="bold blue")
-            table.add_column("Status", style="green", no_wrap=True)
-            table.add_column("ID", style="cyan", no_wrap=True)
-            table.add_column("Nama")
-            for p in providers:
-                status = "[green]● Terhubung[/green]" if p["has_credentials"] else "[dim]○ Belum terhubung[/dim]"
-                table.add_row(status, p["id"], p.get("name", p["id"]))
-            console.print()
-            console.print(table)
-            console.print("[dim]Cara pakai: nomor=pilih · teks=Saring · /providers (/daftar) teks untuk menyaring · contoh: /providers gemini[/dim]")
-            console.print()
-        else:
-            print(f"\n╭─ Penyedia Cari: {filter_q.strip() if filter_q.strip() else '—'} — {_st0} — {_lbl0} — {_pos0} ─" + "─" * 20 + "╮")
-            for p in providers:
-                s = "● Terhubung" if p["has_credentials"] else "○ Belum terhubung"
-                print(f"│   {s} — {p['id']} ({p.get('name', '')})")
-            print("│ Cara pakai: nomor=pilih · teks=Saring · /providers (/daftar) teks untuk menyaring · contoh: /providers gemini")
-            print("╰" + "─" * 40 + "╯\n")
+        _print(f"[bold]{_st0} — {_lbl0} — {_pos0}[/bold]")
+        for _p in _diperkaya:
+            try:
+                _s = "● Terhubung" if _p.get("has_credentials") else "○ Belum terhubung"
+                _print(f"  {_s} — {_p.get('id')} ({_p.get('name', '')})")
+            except Exception:
+                continue
+        try:
+            _fk = globals().get("footer_petunjuk")
+            _print(str(_fk(False)) if callable(_fk) else "Ketik cari · Enter pilih · Esc batal · /bantuan")
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # /models
@@ -2435,17 +1951,47 @@ class CodeAICLI:
         registry = self._registry()
         models = registry.list_models(provider_id)
         try:
+            _prov0, _mod0 = self.get_active_info()
+            _aktif = f"{_prov0}/{_mod0}" if "/" not in str(_mod0) else str(_mod0)
+        except Exception:
+            _aktif = ""
+        if not models:
+            try:
+                _msg = self._render_error_box(
+                    f"Tidak ada model untuk '{provider_id}'",
+                    "coba kata kunci lain",
+                    ["ketik /model untuk memilih, contoh: /model gemini", "ketik /provider untuk menyambung, contoh: /provider gemini", "ketik /bantuan untuk bantuan"],
+                )
+            except Exception:
+                _msg = f"Tidak ada model untuk '{provider_id}'"
+            _print(_msg)
+            return
+        try:
+            _fnr = globals().get("run_model_read")
+            if callable(_fnr):
+                _fnr(models, active_id=_aktif, out=_print)
+                return
+        except Exception:
+            pass
+        try:
+            _fnm = globals().get("render_model_list")
+            if callable(_fnm):
+                _print(str(_fnm(models, active_id=_aktif)))
+                return
+        except Exception:
+            pass
+        try:
             _st0, _lbl0, _pos0 = self._status_baku()
         except Exception:
             _st0, _lbl0, _pos0 = ("○ Belum terhubung", "belum ada model", "Langkah 1: ketik /provider")
-        if not models:
-            _print(f"[yellow]Tidak ada model untuk '{provider_id}'.[/yellow] [dim]{_st0} — {_lbl0} — {_pos0} · Contoh: /model gemini[/dim]")
-            return
-        _print(f"\n[bold]{_st0} — {_lbl0} — {_pos0}[/bold]")
-        _print(f"[bold]Model untuk {provider_id}:[/bold] [dim]Cari: ketik kata kunci · contoh: gemini[/dim]")
+        _print(f"[bold]{_st0} — {_lbl0} — {_pos0}[/bold]")
         for i, m in enumerate(models, 1):
             _print(f"  [cyan]{i}. {m}[/cyan]")
-        _print(f"[dim]Cara pakai: ketik untuk mencari · tombol atas bawah untuk pindah · Enter untuk pilih · Esc untuk batal · contoh: /model {provider_id}[/dim]")
+        try:
+            _fk2 = globals().get("footer_petunjuk")
+            _print(str(_fk2(False)) if callable(_fk2) else "Ketik cari · Enter pilih · Esc batal · /bantuan")
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # /provider (auth unified builtin+custom, stdlib only)
@@ -2527,7 +2073,40 @@ class CodeAICLI:
         if _actual is not None:
             self._auth_provider(_actual)
             return
-        _print(f"[red]Penyedia tidak dikenal '{_want}'.[/red] [dim](lihat /provider list, contoh: /provider gemini)[/dim]")
+        # Saran valid via screens suggest_providers + error_box + detail.
+        try:
+            _sfn = globals().get("suggest_providers")
+            _saran = _sfn(_want, _provs2, 5) if callable(_sfn) else []
+        except Exception:
+            _saran = []
+        try:
+            _langkah = ["ketik /provider untuk daftar, contoh: /provider list", "ketik /bantuan untuk bantuan"]
+            if _saran:
+                try:
+                    _dtampil = ", ".join(list(_saran)[:5])
+                    if _dtampil:
+                        _langkah.insert(0, f"coba /provider {_saran[0]}, contoh: /provider {_saran[0]}")
+                except Exception:
+                    pass
+            _print(self._render_error_box(f"Penyedia tidak dikenal '{_want}'.", "lihat daftar penyedia", _langkah))
+        except Exception:
+            _print(f"[red]Penyedia tidak dikenal '{_want}'.[/red] [dim](lihat /provider list, contoh: /provider gemini)[/dim]")
+        try:
+            _dfn = globals().get("render_provider_detail")
+            if callable(_dfn) and _saran:
+                try:
+                    for _sid in list(_saran)[:1]:
+                        for _pp in (_provs2 or []):
+                            try:
+                                if str(_pp.get("id", "")).strip() == str(_sid).strip():
+                                    _print(str(_dfn(_pp)))
+                                    break
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+        except Exception:
+            pass
         self._provider_list()
         return
 
@@ -2603,7 +2182,17 @@ class CodeAICLI:
                 return [], "fetch failed"
 
     def _provider_test_connection(self, base_url: str, api_key: str = "", timeout: float = 10.0):
-        """Tes koneksi: HTTP respons apa pun (200/401/403/404) = reachable; hanya network error = gagal."""
+        """Tes koneksi via screens test_koneksi (satu jalur, tanpa duplikasi)."""
+        try:
+            _tfn = globals().get("test_koneksi")
+            if callable(_tfn):
+                try:
+                    return _tfn(base_url, api_key, timeout=timeout)
+                except TypeError:
+                    return _tfn(base_url, api_key)
+        except Exception:
+            pass
+        # Fallback stdlib (mirror screens) bila screens tak tersedia.
         try:
             import urllib.request as _ur
             import urllib.error as _ue
@@ -2695,15 +2284,27 @@ class CodeAICLI:
             _print("[dim]Dibatalkan.[/dim]")
             return
         _base = (_raw_base or "").strip().rstrip("/")
+        # Validasi via screens validate_base_url (satu jalur, stdlib).
         try:
-            import urllib.parse as _up
-            _ok_scheme = _base.startswith("http://") or _base.startswith("https://")
-            _parsed = _up.urlparse(_base) if _ok_scheme else None
-            _ok_url = bool(_ok_scheme and _parsed is not None and _parsed.netloc)
+            _vfn = globals().get("validate_base_url")
+            if callable(_vfn):
+                _ok_url, _pesan_url = _vfn(_base)
+            else:
+                raise RuntimeError("no screens")
         except Exception:
-            _ok_url = False
+            try:
+                import urllib.parse as _up
+                _ok_scheme = _base.startswith("http://") or _base.startswith("https://")
+                _parsed = _up.urlparse(_base) if _ok_scheme else None
+                _ok_url = bool(_ok_scheme and _parsed is not None and _parsed.netloc)
+                _pesan_url = "" if _ok_url else "Alamat dasar tidak valid. Harus http(s)://host… contoh: https://api.example.com/v1"
+            except Exception:
+                _ok_url, _pesan_url = False, "Alamat dasar tidak valid. Harus http(s)://host… contoh: https://api.example.com/v1"
         if not _ok_url:
-            _print("[red]Alamat dasar tidak valid.[/red] [dim]Harus http(s)://host… contoh: https://api.example.com/v1[/dim]")
+            try:
+                _print(self._render_error_box(str(_pesan_url or "Alamat dasar tidak valid."), "periksa alamat dasar", ["ketik /provider untuk daftar, contoh: /provider list", "ketik /bantuan untuk bantuan"]))
+            except Exception:
+                _print("[red]Alamat dasar tidak valid.[/red] [dim]Harus http(s)://host… contoh: https://api.example.com/v1[/dim]")
             return
         # --- api key opsional (tersembunyi) ---
         _key = self._provider_prompt_secret("Kunci API (opsional, Enter=kosong): ")
@@ -2729,13 +2330,23 @@ class CodeAICLI:
                 _models = [m.strip() for m in _mtxt.split(",") if m.strip()]
             else:
                 _models = []
-        # --- validasi penuh: URL + tes koneksi; gagal → batal, jangan simpan buta ---
+        # --- validasi penuh: URL + tes koneksi via screens test_koneksi; gagal → batal ---
         try:
-            _ok_conn, _cerr = self._provider_test_connection(_base, _key, timeout=10.0)
+            _tfn = globals().get("test_koneksi")
+            if callable(_tfn):
+                try:
+                    _ok_conn, _cerr = _tfn(_base, _key, timeout=10.0)
+                except TypeError:
+                    _ok_conn, _cerr = _tfn(_base, _key)
+            else:
+                _ok_conn, _cerr = self._provider_test_connection(_base, _key, timeout=10.0)
         except Exception:
             _ok_conn, _cerr = False, "tes sambungan Gagal"
         if not _ok_conn:
-            _print(f"[red]Tes sambungan Gagal: {_cerr}[/red] [dim]Periksa alamat dasar/jaringan. Dibatalkan, tidak disimpan.[/dim]")
+            try:
+                _print(self._render_error_box(f"Tes sambungan Gagal: {_cerr}", "periksa alamat dasar/jaringan. Dibatalkan, tidak disimpan", ["ketik /provider untuk daftar, contoh: /provider list", "ketik /bantuan untuk bantuan"]))
+            except Exception:
+                _print(f"[red]Tes sambungan Gagal: {_cerr}[/red] [dim]Periksa alamat dasar/jaringan. Dibatalkan, tidak disimpan.[/dim]")
             return
         # --- sukses → simpan ---
         try:
@@ -2788,6 +2399,7 @@ class CodeAICLI:
             _print(f"[dim]Tersimpan. Gunakan /model {_pid}/<nama> untuk pindah. Contoh: /model {_pid}/[/dim]")
 
     def _provider_list(self) -> None:
+        # Daftar via screens render_provider_list (satu jalur, tanpa Table ganda).
         try:
             _provs = self._list_providers_fast()
         except Exception:
@@ -2796,57 +2408,69 @@ class CodeAICLI:
             _reg = self._registry()
         except Exception:
             _reg = None
-        _rows: list = []
+        _diperkaya: list = []
         for _p in _provs or []:
             try:
                 _pid = str(_p.get("id", "")).strip()
                 if not _pid:
                     continue
-                _name = str(_p.get("name", _pid))
-                _has = bool(_p.get("has_credentials"))
-                _status = "● Terhubung" if _has else "○ Belum terhubung"
-                _api = ""
-                _n = 0
+                _ent = dict(_p)
                 try:
                     _desc = _reg.get_provider_descriptor(_pid) if _reg is not None else None
                 except Exception:
                     _desc = None
-                if isinstance(_desc, dict):
-                    _api = str(_desc.get("api", "") or "")
-                    _md = _desc.get("models", {})
-                    if isinstance(_md, dict):
-                        _n = len(_md)
-                    elif isinstance(_md, list):
-                        _n = len(_md)
                 try:
-                    _reg_models = _reg.list_models(_pid) if _reg is not None and hasattr(_reg, "list_models") else []
-                    if _reg_models:
-                        _n = len(list(_reg_models))
+                    if isinstance(_desc, dict):
+                        for _k in ("baseURL", "base_url", "api"):
+                            try:
+                                _v = _desc.get(_k)
+                                if isinstance(_v, str) and _v.strip() and not str(_ent.get("api") or "").strip():
+                                    _ent["api"] = _v.strip()
+                                    break
+                            except Exception:
+                                continue
+                        _md = _desc.get("models", {})
+                        if isinstance(_md, dict):
+                            _ent["models"] = list(_md.keys())
+                        elif isinstance(_md, list):
+                            _ent["models"] = list(_md)
                 except Exception:
                     pass
-                _short_api = _api if len(_api) <= 34 else (_api[:31] + "…")
-                _rows.append((_pid, _name, _short_api, _n, _status))
+                try:
+                    _rl = _reg.list_models(_pid) if _reg is not None and hasattr(_reg, "list_models") else []
+                    if _rl:
+                        _ent["models"] = list(_rl)
+                except Exception:
+                    pass
+                _diperkaya.append(_ent)
             except Exception:
                 continue
-        if RICH_AVAILABLE:
-            table = Table(title="Penyedia (kustom via /provider add)", show_header=True, header_style="bold blue")
-            table.add_column("ID", style="cyan", no_wrap=True)
-            table.add_column("Nama")
-            table.add_column("BaseURL", no_wrap=True)
-            table.add_column("Model", justify="right")
-            table.add_column("Status")
-            for _pid, _name, _api_s, _n, _st in _rows:
-                table.add_row(_pid, _name, _api_s or "—", str(_n), f"[green]{_st}[/green]" if "●" in _st else f"[dim]{_st}[/dim]")
-            console.print()
-            console.print(table)
-            console.print("[dim]Cara pakai: /provider add · /provider remove <id> · /model untuk pindah · contoh: /provider list[/dim]")
-            console.print()
-        else:
-            print("\n── Penyedia (kustom via /provider add) ──")
-            for _pid, _name, _api_s, _n, _st in _rows:
-                _mark = "● Terhubung" if "●" in _st else "○ Belum terhubung"
-                print(f"  {_mark} — {_pid} ({_name}) [{_n} model] {_api_s or ''}")
-            print("  Cara pakai: /provider add · /provider remove <id> · /model untuk pindah · contoh: /provider list\n")
+        try:
+            _fn = globals().get("render_provider_list")
+            if callable(_fn):
+                _print(str(_fn(_diperkaya)))
+                return
+        except Exception:
+            pass
+        try:
+            _fnr = globals().get("run_provider_read")
+            if callable(_fnr):
+                _fnr(_diperkaya, out=_print)
+                return
+        except Exception:
+            pass
+        # Fallback manual valid (tanpa perintah tak ada).
+        for _e in _diperkaya:
+            try:
+                _s = "● Terhubung" if _e.get("has_credentials") else "○ Belum terhubung"
+                _print(f"  {_s} — {_e.get('id')} ({_e.get('name', '')})")
+            except Exception:
+                continue
+        try:
+            _fk = globals().get("footer_petunjuk")
+            _print(str(_fk(False)) if callable(_fk) else "Ketik cari · Enter pilih · Esc batal · /bantuan")
+        except Exception:
+            pass
 
     def _provider_remove(self, target: str = "") -> None:
         _pid_raw = (target or "").strip()
@@ -2885,9 +2509,15 @@ class CodeAICLI:
             except Exception:
                 _desc = None
             if _desc is None:
-                _print(f"[red]Penyedia '{_want}' tidak ditemukan atau bukan kustom.[/red] [dim](lihat /provider list, contoh: /provider list)[/dim]")
+                try:
+                    _print(self._render_error_box(f"Penyedia '{_want}' tidak ditemukan atau bukan kustom.", "lihat daftar penyedia", ["ketik /provider untuk daftar, contoh: /provider list", "ketik /bantuan untuk bantuan"]))
+                except Exception:
+                    _print(f"[red]Penyedia '{_want}' tidak ditemukan atau bukan kustom.[/red] [dim](lihat /provider list, contoh: /provider list)[/dim]")
             else:
-                _print(f"[red]Tidak bisa hapus bawaan '{_check}'.[/red] [dim]Hanya penyedia kustom yang bisa dihapus.[/dim]")
+                try:
+                    _print(self._render_error_box(f"Tidak bisa hapus bawaan '{_check}'.", "hanya penyedia kustom yang bisa dihapus", ["ketik /provider untuk daftar, contoh: /provider list", "ketik /bantuan untuk bantuan"]))
+                except Exception:
+                    _print(f"[red]Tidak bisa hapus bawaan '{_check}'.[/red] [dim]Hanya penyedia kustom yang bisa dihapus.[/dim]")
             return
         try:
             _conf = (Prompt.ask(f"Hapus penyedia kustom '{_check}'? Contoh y", choices=["y", "n"], default="n") if RICH_AVAILABLE else input(f"Hapus '{_check}'? Contoh y [y/N]: "))
@@ -3083,6 +2713,13 @@ class CodeAICLI:
             return [m["id"] for m in connected]
 
         def _suggest(q: str, n: int = 5) -> list:
+            # Saran valid via screens suggest_models (maks 5, tanpa perintah tak ada).
+            try:
+                _fn = globals().get("suggest_models")
+                if callable(_fn):
+                    return list(_fn(q, connected, n))[:5]
+            except Exception:
+                pass
             try:
                 _all = _ids()
                 _m = difflib.get_close_matches(q, _all, n=n, cutoff=0.3)
@@ -3093,6 +2730,43 @@ class CodeAICLI:
                 return _ids()[:n]
 
         def _reject(q: str) -> None:
+            # Tolak via screens error_box + suggest_models + render_model_list.
+            try:
+                _saran = _suggest(q, 5)
+            except Exception:
+                _saran = []
+            try:
+                _fnl = globals().get("render_model_list")
+                _daftar = str(_fnl(_saran, active_id="")) if (callable(_fnl) and _saran) else ""
+            except Exception:
+                _daftar = ""
+            try:
+                _msg = self._render_error_box(
+                    f"Tidak cocok: '{q}'",
+                    "coba /model <kata kunci>",
+                    ["ketik /model untuk memilih, contoh: /model gemini", "ketik /provider untuk menyambung, contoh: /provider gemini", "ketik /bantuan untuk bantuan"],
+                )
+                _print(_msg)
+                if _daftar:
+                    _print(_daftar)
+                else:
+                    for _c in _saran:
+                        _print(f"  [cyan]{_c}[/cyan]")
+                try:
+                    _fnd = globals().get("render_model_detail")
+                    if callable(_fnd) and connected and _saran:
+                        for _mm in connected:
+                            try:
+                                if str(_mm.get("id", "")) == str(_saran[0]):
+                                    _print(str(_fnd(_mm, 1, len(connected), "")))
+                                    break
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+                return
+            except Exception:
+                pass
             _print(f"[red]✗ tidak cocok: '{q}'[/red] [dim]coba /model <kata kunci>, contoh: /model gemini[/dim]")
             for _c in _suggest(q, 5):
                 _print(f"  [cyan]{_c}[/cyan]")
@@ -3233,9 +2907,40 @@ class CodeAICLI:
             return
 
         if not connected:
-            _print("[yellow]○ Belum terhubung — belum ada model — Langkah 1: ketik /provider[/yellow] [dim]Contoh: /provider gemini[/dim]")
+            try:
+                _msg0 = self._render_error_box(
+                    "Belum terhubung — belum ada model.",
+                    "Langkah 1: ketik /provider",
+                    ["ketik /provider untuk menyambung, contoh: /provider gemini", "ketik /bantuan untuk bantuan"],
+                )
+                _print(_msg0)
+                try:
+                    _fn0 = globals().get("run_model_read")
+                    if callable(_fn0):
+                        _fn0([], active_id="", out=_print)
+                except Exception:
+                    pass
+            except Exception:
+                _print("[yellow]○ Belum terhubung — belum ada model — Langkah 1: ketik /provider[/yellow] [dim]Contoh: /provider gemini[/dim]")
             return
-        # Tanpa arg → TUI SEMUA connected (live filter, viewport 15 ikut highlight).
+        # Tanpa arg → interaksi via screens run_model_use (fallback _tui_pick).
+        try:
+            _fnu = globals().get("run_model_use")
+            if callable(_fnu):
+                try:
+                    _hasil = _fnu(connected, active_id="", kueri="", pick_fn=self._tui_pick, switch_fn=lambda mid: _do_switch(mid), out=_print)
+                    if _hasil:
+                        return
+                    # run_model_use sudah mencetak Dibatalkan/tolak; jangan ganda.
+                    try:
+                        _cek_aktif, _ = self.get_active_info()
+                    except Exception:
+                        pass
+                    return
+                except Exception:
+                    pass
+        except Exception:
+            pass
         _pool0 = connected
         _pick0 = self._tui_pick("Model — pilih Cari: ketik kata kunci", _pool0, show=_show_fn, initial="")
         if _pick0 is None:
@@ -3260,34 +2965,75 @@ class CodeAICLI:
         if _cmd == "list":
             combos = manager.list_combos()
             if not combos:
-                _print("[yellow]Belum ada gabungan tersimpan.[/yellow] [dim]Contoh: /combo create[/dim]")
+                try:
+                    _print(self._render_error_box("Belum ada gabungan tersimpan.", "buat baru via /combo", ["ketik /combo untuk membuat, contoh: /combo create", "ketik /bantuan untuk bantuan"]))
+                except Exception:
+                    _print("[yellow]Belum ada gabungan tersimpan.[/yellow] [dim]Contoh: /combo create[/dim]")
                 return
             try:
                 _ap, _am = self.get_active_info()
             except Exception:
                 _ap, _am = "", ""
             try:
+                _aktif = _am.split("/", 1)[1] if str(_am or "").startswith("combo/") else (str(_am or "") if str(_ap or "") == "combo" else "")
+            except Exception:
+                _aktif = ""
+            # Render via screens render_daftar (tanpa daftar member penuh, tanpa Table ganda).
+            # Normalisasi kunci strategi->strategi untuk layar (manager tetap strategy).
+            try:
+                _fnl = globals().get("render_daftar")
+                if callable(_fnl):
+                    try:
+                        _st0, _lbl0, _pos0 = self._status_baku()
+                        _posisi = str(_pos0 or "")
+                    except Exception:
+                        _posisi = ""
+                    try:
+                        _tampil_combos = {}
+                        for _kn, _vd in list((combos or {}).items()):
+                            try:
+                                _dd = dict(_vd) if isinstance(_vd, dict) else {}
+                                if "strategi" not in _dd and "strategy" in _dd:
+                                    _dd["strategi"] = _dd.get("strategy")
+                                _tampil_combos[_kn] = _dd
+                            except Exception:
+                                _tampil_combos[_kn] = _vd
+                    except Exception:
+                        _tampil_combos = combos
+                    _print(str(_fnl(_tampil_combos, aktif=_aktif, posisi=_posisi)))
+                    # Detail aktif via render_detail (Compact, maks 5 ID).
+                    try:
+                        _fnd = globals().get("render_detail")
+                        if callable(_fnd) and _aktif and _aktif in (combos or {}):
+                            _dd0 = dict(combos.get(_aktif) or {})
+                            if "strategi" not in _dd0 and "strategy" in _dd0:
+                                _dd0["strategi"] = _dd0.get("strategy")
+                            _print(str(_fnd(_aktif, _dd0, posisi=_posisi)))
+                    except Exception:
+                        pass
+                    return
+            except Exception:
+                pass
+            # Fallback manual valid (tanpa sebar member penuh).
+            try:
                 _st0, _lbl0, _pos0 = self._status_baku()
             except Exception:
                 _st0, _lbl0, _pos0 = ("○ Belum terhubung", "belum ada model", "Langkah 1: ketik /provider")
-            if RICH_AVAILABLE:
-                table = Table(title=f"Gabungan — {_st0} — {_lbl0} — {_pos0}", show_header=True, header_style="bold blue")
-                table.add_column("Nama", style="cyan")
-                table.add_column("Strategi")
-                table.add_column("Model")
-                for name, data in combos.items():
-                    _mark = " ★ aktif" if (_ap == "combo" and _am == name) else ""
-                    table.add_row(f"{name}{_mark}", data["strategy"], ", ".join(data["models"]))
-                console.print()
-                console.print(table)
-                console.print("[dim]Cara pakai: ketik untuk mencari · tombol atas bawah untuk pindah · Enter untuk pilih · Esc untuk batal · contoh: /combo use andalan[/dim]")
-                console.print()
-            else:
-                print(f"\nGabungan — {_st0} — {_lbl0} — {_pos0}:")
-                for name, data in combos.items():
-                    _mark = " ★ aktif" if (_ap == "combo" and _am == name) else ""
-                    print(f"  {name}{_mark} [{data['strategy']}]: {', '.join(data['models'])}")
-                print("[dim]Contoh: /combo use andalan[/dim]\n")
+            _print(f"Gabungan — {_st0} — {_lbl0} — {_pos0}:")
+            for name in sorted(combos.keys()):
+                try:
+                    _d = combos.get(name) or {}
+                    _strat = str(_d.get("strategy", "?") or "?")
+                    _n = len(list(_d.get("models", []) or []))
+                    _mark = " ★ aktif" if (_aktif == name) else ""
+                    _print(f"  {name}{_mark} [{_strat}]: {_n} model")
+                except Exception:
+                    continue
+            try:
+                _fk = globals().get("footer_petunjuk")
+                _print(str(_fk(False)) if callable(_fk) else "Ketik cari · Enter pilih · Esc batal · /bantuan")
+            except Exception:
+                pass
 
         elif _cmd == "use":
             self._combo_use(_rest)
@@ -3296,6 +3042,42 @@ class CodeAICLI:
             self._combo_edit(_rest)
             return
         elif _cmd == "remove":
+            # Hapus via screens flow_remove (konfirmasi + tolak unknown), bisnis delete tetap.
+            try:
+                _fr = globals().get("flow_remove")
+                if callable(_fr):
+                    try:
+                        _combos0 = manager.list_combos() or {}
+                    except Exception:
+                        _combos0 = {}
+                    _tanya = (lambda p: Prompt.ask(p.strip(), default="n") if RICH_AVAILABLE else input(p))
+                    _ok, _pesan = _fr(_rest, _combos0, konfirmasi=_tanya, tampil=_print)
+                    if not _ok:
+                        return
+                    # flow_remove validasi+konfirmasi lolos → delete bisnis.
+                    try:
+                        _kanon = str(_rest or "").strip()
+                        if _kanon.lower().startswith("combo/"):
+                            _kanon = _kanon.split("/", 1)[1].strip()
+                        # Cari kanonik case-insensitive seperti manager.
+                        try:
+                            for _k in list(_combos0.keys()):
+                                if isinstance(_k, str) and _k.strip().lower() == _kanon.strip().lower():
+                                    _kanon = _k
+                                    break
+                        except Exception:
+                            pass
+                        manager.delete_combo(_kanon)
+                    except Exception as _e:
+                        try:
+                            _print(self._render_error_box(f"Gagal hapus gabungan: {_e}", "", ["ketik /combo untuk daftar, contoh: /combo list", "ketik /bantuan untuk bantuan"]))
+                        except Exception:
+                            _print(f"[red]Gagal hapus gabungan: {_e}[/red] [dim]Contoh: /combo list[/dim]")
+                        return
+                    _print(f"[bold green]✅ Gabungan '{_kanon}' dihapus.[/bold green]")
+                    return
+            except Exception:
+                pass
             _name = _rest.strip()
             if _name.lower().startswith("combo/"):
                 _name = _name.split("/", 1)[1].strip()
@@ -3307,7 +3089,10 @@ class CodeAICLI:
             except Exception:
                 _existing = None
             if not _existing:
-                _print(f"[red]Gabungan '{_name}' tidak ditemukan.[/red] [dim](lihat /combo list, contoh: /combo list)[/dim]")
+                try:
+                    _print(self._render_error_box(f"Gabungan '{_name}' tidak ditemukan.", "lihat daftar gabungan", ["ketik /combo untuk daftar, contoh: /combo list", "ketik /bantuan untuk bantuan"]))
+                except Exception:
+                    _print(f"[red]Gabungan '{_name}' tidak ditemukan.[/red] [dim](lihat /combo list, contoh: /combo list)[/dim]")
                 return
             try:
                 _conf = (Prompt.ask(f"Hapus gabungan '{_name}'? Contoh y", choices=["y", "n"], default="n") if RICH_AVAILABLE else input(f"Hapus gabungan '{_name}'? Contoh y [y/N]: "))
@@ -3320,31 +3105,73 @@ class CodeAICLI:
             try:
                 manager.delete_combo(_name)
             except Exception as _e:
-                _print(f"[red]Gagal hapus gabungan: {_e}[/red] [dim]Contoh: /combo list[/dim]")
+                try:
+                    _print(self._render_error_box(f"Gagal hapus gabungan: {_e}", "", ["ketik /combo untuk daftar, contoh: /combo list", "ketik /bantuan untuk bantuan"]))
+                except Exception:
+                    _print(f"[red]Gagal hapus gabungan: {_e}[/red] [dim]Contoh: /combo list[/dim]")
                 return
             _print(f"[bold green]✅ Gabungan '{_name}' dihapus.[/bold green]")
             return
         elif not _cmd or _cmd == "create":
             connected = self._list_connected_fast()
             if not connected:
-                _print("[yellow]○ Belum terhubung — belum ada model — Langkah 1: ketik /provider[/yellow] [dim]Contoh: /provider gemini[/dim]")
+                try:
+                    _print(self._render_error_box("Belum terhubung — belum ada model.", "Langkah 1: ketik /provider", ["ketik /provider untuk menyambung, contoh: /provider gemini", "ketik /bantuan untuk bantuan"]))
+                except Exception:
+                    _print("[yellow]○ Belum terhubung — belum ada model — Langkah 1: ketik /provider[/yellow] [dim]Contoh: /provider gemini[/dim]")
                 return
 
-            # Alur: nama → strategi (12 semua) → multi-pilih model → simpan.
+            # Alur via screens flow_create (nama→strategi 12→multi model), simpan via manager.
+            try:
+                _fc = globals().get("flow_create")
+                if callable(_fc):
+                    _tanya = (lambda p: Prompt.ask(p.strip(), default="") if RICH_AVAILABLE else input(p))
+                    # Bungkus picker screens agar flow_create memakai satu jalur.
+                    def _pilih_strategi(judul, items, show=None, **kw):
+                        try:
+                            return self._tui_pick(judul, list(items), show=(show or (lambda x: x)), initial=str(kw.get("initial", "")))
+                        except Exception:
+                            return None
+                    def _pilih_models(judul, items, show=None, **kw):
+                        try:
+                            return self._tui_pick_multi(judul, list(items), show=(show or (lambda m: m["id"] if isinstance(m, dict) else str(m))), initial=str(kw.get("initial", "")), initial_selected=kw.get("initial_selected"))
+                        except Exception:
+                            return []
+                    _hasil = _fc(connected, tanya_nama=_tanya, pilih_strategi=_pilih_strategi, pilih_models=_pilih_models, tampil=_print)
+                    if not _hasil:
+                        return
+                    try:
+                        _nm = str(_hasil.get("name", "")).strip()
+                        _st = str(_hasil.get("strategy", "")).strip()
+                        _ms = list(_hasil.get("models", []) or [])
+                    except Exception:
+                        return
+                    # Simpan bisnis tetap via manager.
+                    manager.create_combo(_nm, _st, _ms)
+                    _print(f"[bold green]✅ Gabungan '{_nm}' tersimpan.[/bold green] [dim]({_st} · {len(_ms)} model · pakai via /model combo/{_nm}, contoh: /model combo/{_nm})[/dim]")
+                    try:
+                        sw = Prompt.ask("Pindah ke gabungan ini? Contoh y", choices=["y", "n"], default="y") if RICH_AVAILABLE else input("Pindah ke gabungan ini? Contoh y [y/N]: ")
+                    except (EOFError, KeyboardInterrupt):
+                        return
+                    if sw.strip().lower() == "y":
+                        self.switch_model(f"combo/{_nm}")
+                    return
+            except Exception:
+                pass
+
+            # Fallback manual (tetap via _tui_pick screens, tanpa Table ganda).
             name = (Prompt.ask("Nama gabungan (kosong=kembali), contoh: andalan") if RICH_AVAILABLE else input("Nama gabungan (kosong=kembali), contoh: andalan: ")).strip()
             if not name or name.lower() in ("back", "q"):
                 _print("[dim]Dibatalkan.[/dim]")
                 return
 
             strategies = [s.value for s in ComboStrategy]
-            # 12 strategi SEMUA tampil (viewport TUI 15) — Enter pilih, Esc batal.
             _spick = self._tui_pick("Gabungan — strategi Cari: ketik kata kunci", strategies, show=lambda x: x, initial="")
             if _spick is None:
                 _print("[dim]Dibatalkan.[/dim]")
                 return
             strategy = strategies[_spick]
 
-            # Multi-pilih model: Spasi toggle ✓, Enter selesai (min 1), Esc/q batal.
             _mpicks = self._tui_pick_multi("Gabungan — model Cari: ketik kata kunci", connected, show=lambda m: m["id"], initial="")
             if not _mpicks:
                 _print("[dim]Dibatalkan.[/dim]")
@@ -3361,25 +3188,51 @@ class CodeAICLI:
             _print("[yellow]Cara pakai: /combo [list|create|use|edit|remove][/yellow] [dim]/combo use <nama> · /combo edit <nama> · /combo remove <nama> (ketik /bantuan, contoh: /combo list)[/dim]")
 
     def _combo_use(self, name_arg: str = "") -> None:
-        """Aktifkan combo via jalur switch yang sudah ada (setara /model combo/<nama>)."""
+        """Aktifkan combo via screens flow_use + jalur switch (bisnis tetap)."""
         from harness.models.combo import ComboManager
         manager = ComboManager()
         try:
             combos = manager.list_combos() or {}
         except Exception:
             combos = {}
+        # Delegasi validasi+picker via screens flow_use (satu jalur).
+        try:
+            _fu = globals().get("flow_use")
+            if callable(_fu):
+                def _pilih(judul, items, show=None, **kw):
+                    try:
+                        return self._tui_pick(judul, list(items), show=(show or (lambda x: x)), initial=str(kw.get("initial", "")))
+                    except Exception:
+                        return None
+                _target, _pesan = _fu(name_arg, combos, pilih=_pilih, tampil=_print)
+                if _target:
+                    try:
+                        self.switch_model(str(_target))
+                    except Exception as _e:
+                        try:
+                            _print(self._render_error_box(f"Gagal pakai gabungan: {_e}", "", ["ketik /combo untuk daftar, contoh: /combo list", "ketik /bantuan untuk bantuan"]))
+                        except Exception:
+                            _print(f"[red]Gagal pakai gabungan: {_e}[/red] [dim]Contoh: /combo list[/dim]")
+                    return
+                return
+        except Exception:
+            pass
         _name = (name_arg or "").strip()
         if _name.lower().startswith("combo/"):
             _name = _name.split("/", 1)[1].strip()
         if not _name:
             if not combos:
-                _print("[yellow]Belum ada gabungan tersimpan.[/yellow] [dim](buat via /combo create, contoh: /combo create)[/dim]")
+                try:
+                    _print(self._render_error_box("Belum ada gabungan tersimpan.", "buat via /combo", ["ketik /combo untuk membuat, contoh: /combo create", "ketik /bantuan untuk bantuan"]))
+                except Exception:
+                    _print("[yellow]Belum ada gabungan tersimpan.[/yellow] [dim](buat via /combo create, contoh: /combo create)[/dim]")
                 return
             items = sorted(combos.keys())
             def _show(n):
                 try:
                     _d = combos.get(n) or {}
-                    return f"{n} [{_d.get('strategy', '?')}] — {', '.join(_d.get('models', []) or [])}"
+                    _n = len(list(_d.get('models', []) or []))
+                    return f"{n} [{_d.get('strategy', '?')}] — {_n} model"
                 except Exception:
                     return str(n)
             _pick = self._tui_pick("Gabungan — pakai Cari: ketik kata kunci", items, show=_show, initial="")
@@ -3401,12 +3254,18 @@ class CodeAICLI:
             except Exception:
                 pass
         if not _def:
-            _print(f"[red]Gabungan '{_name}' tidak ditemukan.[/red] [dim](lihat /combo list, contoh: /combo list)[/dim]")
+            try:
+                _print(self._render_error_box(f"Gabungan '{_name}' tidak ditemukan.", "lihat daftar gabungan", ["ketik /combo untuk daftar, contoh: /combo list", "ketik /bantuan untuk bantuan"]))
+            except Exception:
+                _print(f"[red]Gabungan '{_name}' tidak ditemukan.[/red] [dim](lihat /combo list, contoh: /combo list)[/dim]")
             return
         try:
             self.switch_model(f"combo/{_name}")
         except Exception as _e:
-            _print(f"[red]Gagal pakai gabungan '{_name}': {_e}[/red] [dim]Contoh: /combo list[/dim]")
+            try:
+                _print(self._render_error_box(f"Gagal pakai gabungan '{_name}': {_e}", "", ["ketik /combo untuk daftar, contoh: /combo list", "ketik /bantuan untuk bantuan"]))
+            except Exception:
+                _print(f"[red]Gagal pakai gabungan '{_name}': {_e}[/red] [dim]Contoh: /combo list[/dim]")
 
     def _combo_edit(self, name_arg: str = "") -> None:
         """Ubah strategi + tambah/buang models, simpan overwrite (nama tetap)."""
@@ -3421,13 +3280,17 @@ class CodeAICLI:
             _name = _name.split("/", 1)[1].strip()
         if not _name:
             if not combos:
-                _print("[yellow]Belum ada gabungan tersimpan.[/yellow] [dim](buat via /combo create, contoh: /combo create)[/dim]")
+                try:
+                    _print(self._render_error_box("Belum ada gabungan tersimpan.", "buat via /combo", ["ketik /combo untuk membuat, contoh: /combo create", "ketik /bantuan untuk bantuan"]))
+                except Exception:
+                    _print("[yellow]Belum ada gabungan tersimpan.[/yellow] [dim](buat via /combo create, contoh: /combo create)[/dim]")
                 return
             items = sorted(combos.keys())
             def _show2(n):
                 try:
                     _d = combos.get(n) or {}
-                    return f"{n} [{_d.get('strategy', '?')}] — {', '.join(_d.get('models', []) or [])}"
+                    _n = len(list(_d.get('models', []) or []))
+                    return f"{n} [{_d.get('strategy', '?')}] — {_n} model"
                 except Exception:
                     return str(n)
             _pick0 = self._tui_pick("Gabungan — ubah Cari: ketik kata kunci", items, show=_show2, initial="")
@@ -3450,8 +3313,51 @@ class CodeAICLI:
             except Exception:
                 pass
         if not isinstance(_cur, dict):
-            _print(f"[red]Gabungan '{_name}' tidak ditemukan.[/red] [dim](lihat /combo list, contoh: /combo list)[/dim]")
+            try:
+                _print(self._render_error_box(f"Gabungan '{_name}' tidak ditemukan.", "lihat daftar gabungan", ["ketik /combo untuk daftar, contoh: /combo list", "ketik /bantuan untuk bantuan"]))
+            except Exception:
+                _print(f"[red]Gabungan '{_name}' tidak ditemukan.[/red] [dim](lihat /combo list, contoh: /combo list)[/dim]")
             return
+        # Delegasi ubah via screens flow_edit (diff ringkas ≤5 + konfirmasi), simpan bisnis tetap.
+        try:
+            _fe = globals().get("flow_edit")
+            if callable(_fe):
+                try:
+                    _conn0 = self._list_connected_fast()
+                except Exception:
+                    _conn0 = []
+                def _ps1(judul, items, show=None, **kw):
+                    try:
+                        return self._tui_pick(judul, list(items), show=(show or (lambda x: x)), initial=str(kw.get("initial", "")), initial_index=kw.get("initial_index"))
+                    except Exception:
+                        return None
+                def _pm1(judul, items, show=None, **kw):
+                    try:
+                        return self._tui_pick_multi(judul, list(items), show=(show or (lambda m: m["id"] if isinstance(m, dict) else str(m))), initial=str(kw.get("initial", "")), initial_selected=kw.get("initial_selected"))
+                    except Exception:
+                        return None
+                _tanya1 = (lambda p: Prompt.ask(p.strip(), choices=["y", "n"], default="n") if RICH_AVAILABLE else input(p))
+                _baru = _fe(_canon, _cur, _conn0, pilih_strategi=_ps1, pilih_models=_pm1, konfirmasi=_tanya1, tampil=_print)
+                if _baru:
+                    try:
+                        _nn = str(_baru.get("name", _canon) or _canon)
+                        _ns = str(_baru.get("strategy", "") or "")
+                        _nm2 = list(_baru.get("models", []) or [])
+                    except Exception:
+                        _nn, _ns, _nm2 = _canon, "", []
+                    try:
+                        _cur_params0 = dict(_cur.get("params", {}) or {})
+                    except Exception:
+                        _cur_params0 = {}
+                    try:
+                        manager.create_combo(_nn, _ns, _nm2, params=_cur_params0, overwrite=True)
+                    except TypeError:
+                        manager.create_combo(_nn, _ns, _nm2)
+                    _print(f"[bold green]✅ Gabungan '{_nn}' diperbarui.[/bold green] [dim]({_ns} · {len(_nm2)} model · pakai via /combo use {_nn}, contoh: /combo use {_nn})[/dim]")
+                    return
+                return
+        except Exception:
+            pass
         try:
             _cur_strategy = str(_cur.get("strategy", "") or "")
         except Exception:
@@ -3481,10 +3387,26 @@ class CodeAICLI:
         new_strategy = strategies[_spick]
         connected = self._list_connected_fast()
         if not connected:
-            _print("[yellow]○ Belum terhubung — belum ada model — Langkah 1: ketik /provider[/yellow] [dim]Contoh: /provider gemini[/dim]")
+            try:
+                _print(self._render_error_box("Belum terhubung — belum ada model.", "Langkah 1: ketik /provider", ["ketik /provider untuk menyambung, contoh: /provider gemini", "ketik /bantuan untuk bantuan"]))
+            except Exception:
+                _print("[yellow]○ Belum terhubung — belum ada model — Langkah 1: ketik /provider[/yellow] [dim]Contoh: /provider gemini[/dim]")
             return
+        # Ringkas ID (maks 5 + "+N lagi", tanpa sebar member penuh).
+        def _potong(_ids):
+            try:
+                _bersih = [str(_x).strip() for _x in (_ids or []) if str(_x or "").strip()]
+            except Exception:
+                return "—"
+            if not _bersih:
+                return "—"
+            _tampil = _bersih[:5]
+            _teks = ", ".join(_tampil)
+            if len(_bersih) > 5:
+                _teks += f" +{len(_bersih) - 5} lagi"
+            return _teks
         try:
-            _cur_txt = ", ".join(_cur_models) if _cur_models else "—"
+            _cur_txt = _potong(_cur_models)
         except Exception:
             _cur_txt = "—"
         try:
@@ -3523,19 +3445,19 @@ class CodeAICLI:
         except Exception:
             _strat_txt = str(new_strategy)
         try:
-            _old_txt = ", ".join(_cur_models) if _cur_models else "—"
+            _old_txt = _potong(_cur_models)
         except Exception:
             _old_txt = "—"
         try:
-            _new_txt = ", ".join(new_models) if new_models else "—"
+            _new_txt = _potong(new_models)
         except Exception:
             _new_txt = "—"
         try:
-            _add_txt = ", ".join(_added) if _added else "—"
+            _add_txt = _potong(_added)
         except Exception:
             _add_txt = "—"
         try:
-            _rem_txt = ", ".join(_removed) if _removed else "—"
+            _rem_txt = _potong(_removed)
         except Exception:
             _rem_txt = "—"
         _print(f"Ringkasan perubahan gabungan '{_canon}':")
@@ -3653,7 +3575,7 @@ class CodeAICLI:
             return None, None
 
     def _combo_footer(self, combo_name: str, result) -> None:
-        """Footer tiap respons combo. Fallback strategi+member bila serving tak diekspos (combo.py tak disentuh)."""
+        """Footer respons combo via screens footer_combo (satu baris, tanpa daftar member)."""
         try:
             _cn = str(combo_name or "").strip()
         except Exception:
@@ -3669,29 +3591,47 @@ class CodeAICLI:
             _sp, _sm = self._combo_extract_serving(result)
         except Exception:
             _sp, _sm = None, None
-        if _sp and _sm:
-            _print(f"[dim]Dijawab oleh gabungan {_cn} memakai {_sp}/{_sm}[/dim]")
-            return
+        # Strategi + dicoba untuk fan-out (tanpa daftar member).
+        _strat = ""
+        _dicoba = None
         try:
             from harness.models.combo import ComboManager as _CM2
             _def = _CM2().get_combo(_cn)
+            if isinstance(_def, dict):
+                try:
+                    _strat = str(_def.get("strategy", "") or "")
+                except Exception:
+                    _strat = ""
         except Exception:
-            _def = None
-        if isinstance(_def, dict):
-            try:
-                _strat = str(_def.get("strategy", "?") or "?")
-            except Exception:
-                _strat = "?"
-            try:
-                _mems = list(_def.get("models", []) or [])
-            except Exception:
-                _mems = []
-            _mem_txt = ", ".join(_mems) if _mems else "—"
-            _print(f"[dim]Dijawab oleh gabungan {_cn} memakai {_mem_txt} [{_strat}][/dim]")
-        else:
-            _print(f"[dim]Dijawab oleh gabungan {_cn} memakai — (detail tidak ditemukan)[/dim]")
+            pass
         try:
-            logging.getLogger(__name__).warning("Handoff next-wave: ComboProvider tak mengekspos serving member (butuh serving_provider/serving_model di return dict) — lihat harness/models/combo.py:ComboProvider.chat")
+            if isinstance(result, dict):
+                for _k in ("dicoba", "tried", "n_tried", "attempted"):
+                    try:
+                        if _k in result and result[_k] is not None:
+                            _dicoba = int(result[_k])
+                            break
+                    except Exception:
+                        continue
+        except Exception:
+            _dicoba = None
+        try:
+            _fn = globals().get("footer_combo")
+            if callable(_fn):
+                try:
+                    _teks = str(_fn(_cn, _sp, _sm, _strat, _dicoba))
+                except TypeError:
+                    _teks = str(_fn(_cn, _sp, _sm))
+                # Satu baris, tanpa newline, tanpa daftar member.
+                _teks = str(_teks).replace("\n", " ").strip()
+                _print(f"[dim]{_teks}[/dim]")
+                return
+        except Exception:
+            pass
+        # Fallback satu baris (tanpa member).
+        try:
+            _pakai = f"{str(_sp).strip()}/{str(_sm).strip()}" if (_sp and _sm) else "—"
+            _print(f"[dim]Dijawab gabungan {_cn} memakai {_pakai}[/dim]")
         except Exception:
             pass
 
@@ -3887,9 +3827,8 @@ class CodeAICLI:
                        ("/combo (/c)", "Kelola gabungan [list|create|use|edit|remove]; contoh: /combo list"),
                        ("/models <penyedia>", "Daftar model penyedia; contoh: /models gemini")]),
             ("SAMBUNGAN", [("/provider [id]", "Masuk/pindah penyedia; contoh: /provider gemini"),
-                      ("/providers (/p) (/daftar)", "Daftar penyedia + status Terhubung; contoh: /daftar"),
-                      ("/provider add|list|remove", "Kelola penyedia kustom; contoh: /provider list"),
-                      ("/daftar", "Sama dengan /providers — daftar penyedia")]),
+                      ("/provider list (/p)", "Daftar penyedia + status Terhubung; contoh: /provider list"),
+                      ("/provider add|list|remove", "Kelola penyedia kustom; contoh: /provider list")]),
             ("SESI", [("/steer (/st) (/alih)", "Alihkan tugas berjalan; contoh: /alih lanjutkan"),
                          ("/history (/riwayat)", "Lihat riwayat + kartu fakta; contoh: /riwayat"),
                          ("/status (/s) (/keadaan)", "Lihat penyedia, model, status, posisi; contoh: /keadaan"),
