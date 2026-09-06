@@ -159,7 +159,7 @@ class _TUIPicker:
     VIEWPORT = 15
     FOOTER = "Cara pakai: ketik untuk mencari · tombol atas bawah untuk pindah · Enter untuk pilih · Esc untuk batal"
 
-    def __init__(self, title="", items=None, show=None, initial="", multi=False):
+    def __init__(self, title="", items=None, show=None, initial="", multi=False, initial_selected=None, selected=None, initial_index=None):
         self.title = title or "Pilih"
         self.items = list(items) if items else []
         self.show = show if callable(show) else (lambda x: x)  # noqa: E731
@@ -168,6 +168,37 @@ class _TUIPicker:
         self.idx = 0
         self.selected: List[int] = []
         self._scroll = 0
+        try:
+            _pre = initial_selected if initial_selected is not None else selected
+            if _pre is not None:
+                _n = len(self.items)
+                _seen = set()
+                _out: List[int] = []
+                for _v in list(_pre or []):
+                    try:
+                        _oi = int(_v)
+                    except Exception:
+                        continue
+                    if 0 <= _oi < _n and _oi not in _seen:
+                        _seen.add(_oi)
+                        _out.append(_oi)
+                self.selected = _out
+        except Exception:
+            self.selected = []
+        try:
+            if initial_index is not None:
+                _ii = int(initial_index)
+                _total = len(self.filtered())
+                if _total > 0:
+                    if _ii < 0:
+                        _ii = 0
+                    if _ii >= _total:
+                        _ii = _total - 1
+                    self.idx = _ii
+                    self._scroll = 0
+                    self._viewport(_total)
+        except Exception:
+            pass
 
     def label(self, it) -> str:
         try:
@@ -1007,8 +1038,8 @@ class CodeAICLI:
             filt = _filtered(query)
             continue
 
-    def _popup_pick_multi(self, title: str, items: list, show: Optional[Callable] = None, initial: str = "") -> Optional[List[int]]:
-        """Varian multi-pilih: `1,3` tambah, substring=filter, `done` selesai."""
+    def _popup_pick_multi(self, title: str, items: list, show: Optional[Callable] = None, initial: str = "", initial_selected=None, selected=None) -> Optional[List[int]]:
+        """Varian multi-pilih: `1,3` tambah/cabut, substring=filter, `done` selesai."""
         if show is None:
             show = lambda x: x  # noqa: E731
         if not items:
@@ -1032,6 +1063,23 @@ class CodeAICLI:
             return f"{mark}{_labels(it)}"
 
         selected: List[int] = []
+        try:
+            _pre = initial_selected if initial_selected is not None else selected
+            if _pre is not None:
+                _n = len(items or [])
+                _seen = set()
+                _out: List[int] = []
+                for _v in list(_pre or []):
+                    try:
+                        _oi = int(_v)
+                    except Exception:
+                        continue
+                    if 0 <= _oi < _n and _oi not in _seen:
+                        _seen.add(_oi)
+                        _out.append(_oi)
+                selected = _out
+        except Exception:
+            selected = []
         query = (initial or "").strip()
         filt = _filtered(query)
         hint = "[Cari:] 1,3/selesai/teks (Enter=Selesai/batal, q=batal)"
@@ -1058,7 +1106,9 @@ class CodeAICLI:
                     n = int(p)
                     if 1 <= n <= total:
                         oi = (visible_pairs[n - 1][0] if n <= len(visible_pairs) else filt[n - 1][0])
-                        if oi not in selected:
+                        if oi in selected:
+                            selected.remove(oi)
+                        else:
                             selected.append(oi)
                     else:
                         _print(f"[red]Nomor di luar 1..{total}: {p}[/red]")
@@ -1075,7 +1125,7 @@ class CodeAICLI:
     # ------------------------------------------------------------------
 
     def _tui_pick(self, title: str, items: list, show: Optional[Callable] = None,
-                  initial: str = "", multi: bool = False, _keys=None):
+                  initial: str = "", multi: bool = False, _keys=None, initial_selected=None, selected=None, initial_index=None):
         """Pilih via _TUIPicker fullscreen; fallback _popup_pick bila non-TTY.
 
         single → Optional[int] (index `items`); multi=True → Optional[List[int]].
@@ -1087,20 +1137,20 @@ class CodeAICLI:
             _print("[dim]Tidak ada pilihan.[/dim]")
             return None
         if _keys is not None:
-            return _TUIPicker(title, items, show=show, initial=initial, multi=multi).pick(keys=_keys)
+            return _TUIPicker(title, items, show=show, initial=initial, multi=multi, initial_selected=initial_selected, selected=selected, initial_index=initial_index).pick(keys=_keys)
         if _TUIPicker.available():
             try:
-                return _TUIPicker(title, items, show=show, initial=initial, multi=multi).pick()
+                return _TUIPicker(title, items, show=show, initial=initial, multi=multi, initial_selected=initial_selected, selected=selected, initial_index=initial_index).pick()
             except Exception as e:
                 logging.getLogger(__name__).warning(f"TUI picker gagal, fallback popup: {e}")
         if multi:
-            return self._popup_pick_multi(title, items, show=show, initial=initial)
+            return self._popup_pick_multi(title, items, show=show, initial=initial, initial_selected=initial_selected, selected=selected)
         return self._popup_pick(title, items, show=show, initial=initial)
 
     def _tui_pick_multi(self, title: str, items: list, show: Optional[Callable] = None,
-                        initial: str = "", _keys=None) -> Optional[List[int]]:
+                        initial: str = "", _keys=None, initial_selected=None, selected=None) -> Optional[List[int]]:
         """Multi-pilih: Spasi toggle ✓, Enter selesai (min 1), Esc/q batal."""
-        return self._tui_pick(title, items, show=show, initial=initial, multi=True, _keys=_keys)
+        return self._tui_pick(title, items, show=show, initial=initial, multi=True, _keys=_keys, initial_selected=initial_selected, selected=selected)
 
     # ------------------------------------------------------------------
     # Startup
@@ -3420,7 +3470,11 @@ class CodeAICLI:
                 return f"{s} ★ saat ini" if s == _cur_strategy else s
             except Exception:
                 return s
-        _spick = self._tui_pick("Gabungan — strategi baru Cari: ketik kata kunci", strategies, show=_sshow, initial=_cur_strategy or "")
+        try:
+            _strat_idx = strategies.index(_cur_strategy) if _cur_strategy in strategies else 0
+        except Exception:
+            _strat_idx = 0
+        _spick = self._tui_pick("Gabungan — strategi baru Cari: ketik kata kunci", strategies, show=_sshow, initial="", initial_index=_strat_idx)
         if _spick is None:
             _print("[dim]Dibatalkan.[/dim]")
             return
@@ -3433,11 +3487,71 @@ class CodeAICLI:
             _cur_txt = ", ".join(_cur_models) if _cur_models else "—"
         except Exception:
             _cur_txt = "—"
-        _mpicks = self._tui_pick_multi(f"Gabungan — model (saat ini: {_cur_txt}) Cari: ketik kata kunci", connected, show=lambda m: m["id"], initial="")
+        try:
+            _cur_set = set(str(m) for m in (_cur_models or []))
+        except Exception:
+            _cur_set = set()
+        _pre = []
+        try:
+            for _ci, _cm in enumerate(connected or []):
+                try:
+                    _cid = str(_cm.get("id", "") if isinstance(_cm, dict) else str(_cm))
+                except Exception:
+                    continue
+                if _cid in _cur_set:
+                    _pre.append(_ci)
+        except Exception:
+            _pre = []
+        _mpicks = self._tui_pick_multi(f"Gabungan — model (saat ini: {_cur_txt}) Cari: ketik kata kunci", connected, show=lambda m: m["id"], initial="", initial_selected=_pre)
+        if _mpicks is None:
+            _print("[dim]Dibatalkan.[/dim]")
+            return
         if not _mpicks:
             _print("[dim]Dibatalkan.[/dim]")
             return
         new_models = [connected[i]["id"] for i in _mpicks]
+        try:
+            _old_set = set(_cur_models or [])
+            _new_set = set(new_models or [])
+            _added = [m for m in new_models if m not in _old_set]
+            _removed = [m for m in (_cur_models or []) if m not in _new_set]
+        except Exception:
+            _added = []
+            _removed = []
+        try:
+            _strat_txt = f"{_cur_strategy or '—'} → {new_strategy}" if (_cur_strategy or "") != new_strategy else f"{new_strategy} (tetap)"
+        except Exception:
+            _strat_txt = str(new_strategy)
+        try:
+            _old_txt = ", ".join(_cur_models) if _cur_models else "—"
+        except Exception:
+            _old_txt = "—"
+        try:
+            _new_txt = ", ".join(new_models) if new_models else "—"
+        except Exception:
+            _new_txt = "—"
+        try:
+            _add_txt = ", ".join(_added) if _added else "—"
+        except Exception:
+            _add_txt = "—"
+        try:
+            _rem_txt = ", ".join(_removed) if _removed else "—"
+        except Exception:
+            _rem_txt = "—"
+        _print(f"Ringkasan perubahan gabungan '{_canon}':")
+        _print(f"  Strategi: {_strat_txt}")
+        _print(f"  Model awal ({len(_cur_models)}): {_old_txt}")
+        _print(f"  Model baru ({len(new_models)}): {_new_txt}")
+        _print(f"  Ditambah ({len(_added)}): {_add_txt}")
+        _print(f"  Dibuang ({len(_removed)}): {_rem_txt}")
+        try:
+            _conf = (Prompt.ask(f"Simpan perubahan gabungan '{_canon}'? Contoh y", choices=["y", "n"], default="n") if RICH_AVAILABLE else input(f"Simpan perubahan gabungan '{_canon}'? Contoh y [y/N]: "))
+        except (EOFError, KeyboardInterrupt):
+            _print("[dim]Dibatalkan.[/dim]")
+            return
+        if (_conf or "").strip().lower() != "y":
+            _print("[dim]Dibatalkan.[/dim]")
+            return
         try:
             manager.create_combo(_canon, new_strategy, new_models, params=_cur_params, overwrite=True)
         except TypeError:
