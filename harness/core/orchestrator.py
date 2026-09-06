@@ -1,6 +1,8 @@
 import asyncio
+import concurrent.futures
 import logging
 import re
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -11,6 +13,21 @@ from harness.rules.agents_parser import AgentsParser, AgentRules
 from harness.context.compactor import ContextCompactor
 
 logger = logging.getLogger(__name__)
+
+# Discussion-exempt markers vs destructive action verbs for boundary checks.
+# A boundary mention is only treated as benign discussion when it carries a
+# discussion marker AND none of the destructive action verbs below.
+_DISCUSSION_MARKER_RE = re.compile(
+    r"\b(explain|what is|describe|discuss|mention|respect|follow|according to|stay within|comply|adhere)\b",
+    re.IGNORECASE,
+)
+_DESTRUCTIVE_VERB_RE = re.compile(
+    r"\b(delete|deleting|remove|removing|destroy|destroying|erase|erasing|wipe|wiping"
+    r"|bypass|bypassing|ignore|ignoring|disable|disabling|overwrite|overwriting"
+    r"|execute|executing|run|running|kill|dropping?|truncate|truncating|format|formatting"
+    r"|exfiltrat\w*|steal\w*|hack\w*|exploit\w*|inject\w*|\brm\b|\bmv\b|\bchmod\b|\bchown\b)\b",
+    re.IGNORECASE,
+)
 
 
 CODEAI_IDENTITY = (
@@ -44,6 +61,11 @@ class Orchestrator:
         self.spawner = SubagentSpawner(self.message_bus)
         self.active_subagent_id: Optional[str] = None
         self.workflow_state: str = "IDLE"
+        # F03: guard cross async+thread access to workflow_state/active_subagent_id.
+        # Held only for short synchronous reads/writes — never across await.
+        self._state_lock = threading.Lock()
+        # Stash for non-matching parent-queue messages (peek/put-back buffer).
+        self._pending_parent_messages: List[Dict[str, Any]] = []
 
         # Load AGENTS.md rules once at init — if file exists, compliance is mandatory
         self._agents_rules: Optional[AgentRules] = None
@@ -65,6 +87,26 @@ class Orchestrator:
     # ------------------------------------------------------------------
     # AGENTS.md enforcement helpers
     # ------------------------------------------------------------------
+
+    def _get_workflow_state(self) -> str:
+        """Thread-safe read of workflow_state (short lock, never across await)."""
+        with self._state_lock:
+            return self.workflow_state
+
+    def _set_workflow_state(self, value: str) -> None:
+        """Thread-safe write of workflow_state (short lock, never across await)."""
+        with self._state_lock:
+            self.workflow_state = value
+
+    def _get_active_subagent_id(self) -> Optional[str]:
+        """Thread-safe read of active_subagent_id."""
+        with self._state_lock:
+            return self.active_subagent_id
+
+    def _set_active_subagent_id(self, value: Optional[str]) -> None:
+        """Thread-safe write of active_subagent_id."""
+        with self._state_lock:
+            self.active_subagent_id = value
 
     def _preflight_agents_check(self, user_request: str) -> None:
         """
@@ -138,13 +180,14 @@ class Orchestrator:
                 return True
             # Mere mention of the boundary phrase (e.g. "stay within workspace") is benign.
             return False
-        # Generic boundaries: word-boundary match, exempting discussion/mention context.
+        # Generic boundaries: word-boundary match, exempting pure discussion context.
+        # Exempt ONLY when the request is genuinely discussion (has a discussion
+        # marker) AND carries no destructive action verb. Requests like
+        # "explain how to bypass ..." / "discuss how to delete ..." stay violations.
         if self._matches_forbidden(user_request, boundary):
-            if re.search(
-                r"\b(explain|what is|describe|discuss|mention|respect|follow|according to|stay within|comply|adhere)\b",
-                user_request,
-                re.IGNORECASE,
-            ):
+            if _DISCUSSION_MARKER_RE.search(
+                user_request
+            ) and not _DESTRUCTIVE_VERB_RE.search(user_request):
                 return False
             return True
         return False
@@ -224,11 +267,23 @@ class Orchestrator:
             layers.append("[AGENTS]\n(none)")
         base_joined = "\n\n".join(layers)
         with_hooks = self.hooks_dispatcher.dispatch_before_init(base_joined)
+        hooks_touched = with_hooks != base_joined
         if with_hooks != base_joined and with_hooks.startswith(base_joined):
             added = with_hooks[len(base_joined):]
-            system_prompt = base_joined + "\n\n[HOOKS]" + added
+            if added.strip():
+                system_prompt = base_joined + "\n\n[HOOKS]" + added
+            else:
+                system_prompt = base_joined + "\n\n[HOOKS]\n(none)"
         elif "[HOOKS]" not in with_hooks:
-            system_prompt = with_hooks + "\n\n[HOOKS]\n(none)"
+            if hooks_touched:
+                # Dispatcher modified the prompt without an explicit label —
+                # never claim "(none)"; record honestly that hooks applied.
+                system_prompt = (
+                    with_hooks
+                    + "\n\n[HOOKS]\n(applied — dispatcher modified prompt without explicit label)"
+                )
+            else:
+                system_prompt = with_hooks + "\n\n[HOOKS]\n(none)"
         else:
             system_prompt = with_hooks
         if user_request:
@@ -243,30 +298,15 @@ class Orchestrator:
 
     async def run_pipeline(self, user_request: str) -> str:
         """Execute user request through the active LLM provider."""
-        self.workflow_state = "RUNNING"
-        # FR-6: ensure a steerable subagent exists while RUNNING so
-        # steer_active_subagent / process_user_input are reachable.
-        try:
-            _track = self.spawner.spawn(SubagentRole.CODER)
-            _track.current_task = user_request
-            _track.status = SubagentStatus.RUNNING
-            self.active_subagent_id = _track.id
-        except Exception:
-            try:
-                _tmp = f"pipeline-{uuid.uuid4()}"
-                try:
-                    self.message_bus.register_subagent(_tmp)
-                except Exception:
-                    pass
-                self.active_subagent_id = _tmp
-            except Exception:
-                pass
+        self._set_workflow_state("RUNNING")
 
-        # 1. AGENTS.md pre-flight check — blocks request if violation found
+        # 1. AGENTS.md pre-flight check — blocks request if violation found.
+        # NOTE: subagent spawn happens ONLY after these checks pass, so a
+        # blocked request never leaks a stray RUNNING subagent.
         try:
             self._preflight_agents_check(user_request)
         except AgentsComplianceError as e:
-            self.workflow_state = "BLOCKED"
+            self._set_workflow_state("BLOCKED")
             return str(e)
 
         # 1b. Engine tool-call verification before gateway (FR-1).
@@ -278,16 +318,35 @@ class Orchestrator:
                     self._agents_rules,
                 )
                 if not _ok:
-                    self.workflow_state = "BLOCKED"
+                    self._set_workflow_state("BLOCKED")
                     return (
                         "🚫 AGENTS.md Compliance Violation: tool call blocked by verify_tool_call.\n"
                         "AGENTS.md is present — 100% compliance is mandatory. Task blocked."
                     )
         except AgentsComplianceError as e:
-            self.workflow_state = "BLOCKED"
+            self._set_workflow_state("BLOCKED")
             return str(e)
         except Exception:
             pass
+
+        # FR-6: ensure a steerable subagent exists while RUNNING so
+        # steer_active_subagent / process_user_input are reachable.
+        # Spawned here — strictly after AGENTS checks passed.
+        try:
+            _track = self.spawner.spawn(SubagentRole.CODER)
+            _track.current_task = user_request
+            _track.status = SubagentStatus.RUNNING
+            self._set_active_subagent_id(_track.id)
+        except Exception:
+            try:
+                _tmp = f"pipeline-{uuid.uuid4()}"
+                try:
+                    self.message_bus.register_subagent(_tmp)
+                except Exception:
+                    pass
+                self._set_active_subagent_id(_tmp)
+            except Exception:
+                pass
 
         # 2. Build system prompt with strict precedence: Base<System<Global<AGENTS<HOOKS<User
         system_prompt = self._build_precedence_system_prompt(user_request)
@@ -332,18 +391,20 @@ class Orchestrator:
                 self.compactor.add_message("user", user_request)
                 self.compactor.add_message("assistant", content)
 
-                self.workflow_state = "DONE"
+                self._set_workflow_state("DONE")
                 try:
-                    _sub = self.spawner.get_subagent(self.active_subagent_id) if self.active_subagent_id else None
+                    _aid = self._get_active_subagent_id()
+                    _sub = self.spawner.get_subagent(_aid) if _aid else None
                     if _sub is not None:
                         _sub.status = SubagentStatus.DONE
                 except Exception:
                     pass
                 return content
             else:
-                self.workflow_state = "DONE"
+                self._set_workflow_state("DONE")
                 try:
-                    _sub = self.spawner.get_subagent(self.active_subagent_id) if self.active_subagent_id else None
+                    _aid = self._get_active_subagent_id()
+                    _sub = self.spawner.get_subagent(_aid) if _aid else None
                     if _sub is not None:
                         _sub.status = SubagentStatus.DONE
                 except Exception:
@@ -351,9 +412,10 @@ class Orchestrator:
                 return "No LLM Gateway configured for provider."
 
         except Exception as e:
-            self.workflow_state = "ERROR"
+            self._set_workflow_state("ERROR")
             try:
-                _sub = self.spawner.get_subagent(self.active_subagent_id) if self.active_subagent_id else None
+                _aid = self._get_active_subagent_id()
+                _sub = self.spawner.get_subagent(_aid) if _aid else None
                 if _sub is not None:
                     _sub.status = SubagentStatus.ERROR
             except Exception:
@@ -364,42 +426,91 @@ class Orchestrator:
     # Subagent steering
     # ------------------------------------------------------------------
 
-    async def _wait_for_subagent(self, subagent_id: str) -> Dict[str, Any]:
-        """Wait for subagent to complete its task via message bus."""
+    async def _wait_for_subagent(
+        self, subagent_id: str, timeout: float = 120.0
+    ) -> Dict[str, Any]:
+        """Wait for subagent completion, consuming only the matching message.
+
+        Non-matching parent-queue messages are stashed (peek/put-back) in
+        ``self._pending_parent_messages`` instead of being discarded, and the
+        wait is bounded by ``timeout`` seconds (default 120s).
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
         while True:
-            msg = await self.message_bus.receive_from_parent()
+            # Drain stashed messages first (put-back buffer).
+            for _i, _m in enumerate(self._pending_parent_messages):
+                if _m.get("sender_id") == subagent_id and _m.get("type") == "done":
+                    del self._pending_parent_messages[_i]
+                    return _m
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError(
+                    f"Timed out waiting {timeout:g}s for subagent '{subagent_id}'"
+                )
+            msg = await asyncio.wait_for(
+                self.message_bus.receive_from_parent(), timeout=remaining
+            )
             if msg.get("sender_id") == subagent_id and msg.get("type") == "done":
                 return msg
+            # Peeked but not ours — stash for the rightful consumer.
+            self._pending_parent_messages.append(msg)
 
-    async def steer_active_subagent(self, instruction_delta: str):
-        """Injects new instructions to active subagent without resetting context."""
-        if not self.active_subagent_id:
+    async def steer_active_subagent(self, instruction_delta: str) -> bool:
+        """Injects new instructions to active subagent without resetting context.
+
+        Returns True when the steer was delivered, False when the active
+        subagent exists but is not RUNNING (explicit silent-drop replacement).
+        """
+        active_id = self._get_active_subagent_id()
+        if not active_id:
             raise ValueError("No active subagent to steer")
 
-        subagent = self.spawner.get_subagent(self.active_subagent_id)
+        subagent = self.spawner.get_subagent(active_id)
         if subagent and subagent.status == SubagentStatus.RUNNING:
             steer_message = {"type": "steer", "instruction": instruction_delta}
-            await self.message_bus.send_to_subagent(self.active_subagent_id, steer_message)
+            await self.message_bus.send_to_subagent(active_id, steer_message)
+            return True
+        logger.warning(
+            "Steer dropped: subagent '%s' not RUNNING (status=%s)",
+            active_id,
+            getattr(subagent, "status", None),
+        )
+        return False
 
-    async def process_user_input(self, input_text: str):
-        """For real-time user steering."""
-        if self.workflow_state == "RUNNING" and self.active_subagent_id:
-            await self.steer_active_subagent(input_text)
+    async def process_user_input(self, input_text: str) -> bool:
+        """For real-time user steering. Returns True if delivered, False otherwise."""
+        if self._get_workflow_state() == "RUNNING" and self._get_active_subagent_id():
+            steered = await self.steer_active_subagent(input_text)
+            if not steered:
+                logger.warning("process_user_input: steer not delivered (subagent not RUNNING)")
+            return steered
+        logger.warning("process_user_input: no RUNNING workflow/subagent — input not steered")
+        return False
 
     # ------------------------------------------------------------------
     # Sync wrapper
     # ------------------------------------------------------------------
 
-    def run_task(self, task: str) -> str:
-        """Synchronous wrapper for running a pipeline task."""
+    def run_task(self, task: str, timeout: Optional[float] = 300.0) -> str:
+        """Synchronous wrapper for running a pipeline task.
+
+        When called from a thread with a running event loop, the pipeline is
+        delegated to a worker thread that owns a fresh event loop (no
+        cross-loop coroutine sharing), bounded by ``timeout`` seconds.
+        """
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    future = pool.submit(asyncio.run, self.run_pipeline(task))
-                    return future.result()
-            else:
-                return loop.run_until_complete(self.run_pipeline(task))
+            asyncio.get_running_loop()
         except RuntimeError:
+            # No running loop in this thread — create a fresh one here.
             return asyncio.run(self.run_pipeline(task))
+        else:
+            # Running loop in this thread — run pipeline on a dedicated worker
+            # thread with its own new event loop, with an explicit timeout.
+
+            def _target() -> str:
+                return asyncio.run(self.run_pipeline(task))
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(_target)
+                return future.result(timeout=timeout)

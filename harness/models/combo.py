@@ -2,6 +2,7 @@ import copy
 import json
 import os
 import random
+import re
 import tempfile
 import threading
 import time
@@ -32,20 +33,46 @@ class ComboStrategy(str, Enum):
 
 
 class ComboManager:
+    # Shared round-robin counters (process-wide) so fresh ComboProvider
+    # instances per chat still rotate. Guarded by shared lock.
+    _shared_rr: Dict[str, int] = {}
+    _shared_rr_lock = threading.Lock()
+
+    _NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+    _VALID_STRATEGIES = {s.value for s in ComboStrategy}
+
     def __init__(self):
         self.config_dir = Path.home() / ".codeai"
         self.combo_file = self.config_dir / "combos.json"
         self.config_dir.mkdir(parents=True, exist_ok=True)
         self.combos: Dict[str, Dict[str, Any]] = {}
+        self._lock = threading.RLock()
         self._load()
 
     def _load(self):
-        if self.combo_file.exists():
-            try:
-                with open(self.combo_file, "r") as f:
-                    self.combos = json.load(f)
-            except json.JSONDecodeError:
-                self.combos = {}
+        try:
+            exists = self.combo_file.exists()
+        except OSError:
+            self.combos = {}
+            return
+        if not exists:
+            self.combos = {}
+            return
+        try:
+            with open(self.combo_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, UnicodeError, ValueError):
+            # OSError: read/permission; UnicodeError: bad bytes;
+            # ValueError: JSON decode (JSONDecodeError subclasses ValueError)
+            self.combos = {}
+            return
+        except Exception:
+            self.combos = {}
+            return
+        if not isinstance(data, dict):
+            self.combos = {}
+            return
+        self.combos = data
 
     def _save(self):
         self.config_dir.mkdir(parents=True, exist_ok=True)
@@ -79,29 +106,153 @@ class ComboManager:
                     "Use plain provider/model IDs instead."
                 )
 
-    def create_combo(self, name: str, strategy: str, models: List[str], params: Optional[Dict[str, Any]] = None):
-        self._reject_nested_combo(models, name)
-        self.combos[name] = {
-            "strategy": strategy,
-            "models": models,
-            "params": params or {}
-        }
+    @staticmethod
+    def _validate_name(name: Any) -> str:
+        if not isinstance(name, str):
+            raise ValueError(f"Invalid combo name {name!r}: must be a string.")
+        cname = name.strip()
+        if not cname:
+            raise ValueError("Invalid combo name: must be non-empty.")
+        if "/" in cname or "\\" in cname or len(cname.split()) != 1:
+            raise ValueError(
+                f"Invalid combo name {cname!r}: must not contain '/' or whitespace."
+            )
+        if not ComboManager._NAME_RE.match(cname):
+            raise ValueError(
+                f"Invalid combo name {cname!r}: use 1-64 chars [A-Za-z0-9_-]."
+            )
+        return cname
+
+    @staticmethod
+    def _validate_strategy(strategy: Any) -> str:
+        if isinstance(strategy, ComboStrategy):
+            return strategy.value
+        if not isinstance(strategy, str):
+            raise ValueError(f"Invalid combo strategy {strategy!r}: must be a string.")
+        s = strategy.strip()
+        if not s:
+            raise ValueError("Invalid combo strategy: must be non-empty.")
+        # Accept exact value; ComboStrategy is str-Enum so member == value.
+        try:
+            return ComboStrategy(s).value
+        except ValueError:
+            pass
+        if s not in ComboManager._VALID_STRATEGIES:
+            raise ValueError(
+                f"Invalid combo strategy {s!r}: must be one of "
+                f"{sorted(ComboManager._VALID_STRATEGIES)}."
+            )
+        return s
+
+    @staticmethod
+    def _validate_models(models: Any) -> List[str]:
+        if not isinstance(models, (list, tuple)):
+            raise ValueError("Invalid combo models: must be a non-empty list.")
+        cleaned = list(models)
+        if not cleaned:
+            raise ValueError("Invalid combo models: must be non-empty.")
+        for m in cleaned:
+            if not isinstance(m, str) or not m.strip():
+                raise ValueError(
+                    f"Invalid combo model {m!r}: must be a non-empty string."
+                )
+        return [m.strip() for m in cleaned]
+
+    def _instance_lock(self) -> Optional[Any]:
+        try:
+            lk = getattr(self, "_lock", None)
+        except Exception:
+            return None
+        return lk
+
+    def claim_round_robin(self, combo_name: str, num_models: int) -> int:
+        """Atomically claim next round-robin slot for combo (shared, locked)."""
+        if not isinstance(num_models, int) or num_models <= 0:
+            raise ValueError("num_models must be a positive int.")
+        key = str(combo_name)
+        with ComboManager._shared_rr_lock:
+            cur = ComboManager._shared_rr.get(key, 0)
+            ComboManager._shared_rr[key] = cur + 1
+            return cur % num_models
+
+    def create_combo(self, name: str, strategy: str, models: List[str], params: Optional[Dict[str, Any]] = None, overwrite: bool = False):
+        cname = self._validate_name(name)
+        sname = self._validate_strategy(strategy)
+        cleaned_models = self._validate_models(models)
+        if params is None:
+            cleaned_params: Dict[str, Any] = {}
+        elif not isinstance(params, dict):
+            raise ValueError("Invalid combo params: must be a dict.")
+        else:
+            try:
+                cleaned_params = copy.deepcopy(params)
+            except Exception:
+                cleaned_params = dict(params)
+        self._reject_nested_combo(cleaned_models, cname)
+        lk = self._instance_lock()
+        if lk is not None:
+            with lk:
+                if cname in self.combos and not overwrite:
+                    raise ValueError(
+                        f"Combo '{cname}' already exists "
+                        "(use overwrite=True to replace)."
+                    )
+                self.combos[cname] = {
+                    "strategy": sname,
+                    "models": list(cleaned_models),
+                    "params": cleaned_params
+                }
+        else:
+            if cname in self.combos and not overwrite:
+                raise ValueError(
+                    f"Combo '{cname}' already exists "
+                    "(use overwrite=True to replace)."
+                )
+            self.combos[cname] = {
+                "strategy": sname,
+                "models": list(cleaned_models),
+                "params": cleaned_params
+            }
         self._save()
 
     def get_combo(self, name: str) -> Optional[Dict[str, Any]]:
-        return self.combos.get(name)
+        lk = self._instance_lock()
+        if lk is not None:
+            with lk:
+                val = self.combos.get(name)
+                return copy.deepcopy(val) if val is not None else None
+        val = self.combos.get(name)
+        return copy.deepcopy(val) if val is not None else None
 
     def list_combos(self) -> Dict[str, Dict[str, Any]]:
-        return self.combos
+        lk = self._instance_lock()
+        if lk is not None:
+            with lk:
+                return copy.deepcopy(self.combos)
+        return copy.deepcopy(self.combos)
 
-    def delete_combo(self, name: str):
-        if name in self.combos:
-            del self.combos[name]
+    def delete_combo(self, name: str) -> bool:
+        lk = self._instance_lock()
+        if lk is not None:
+            with lk:
+                if name in self.combos:
+                    del self.combos[name]
+                else:
+                    return False
+        else:
+            if name in self.combos:
+                del self.combos[name]
+            else:
+                return False
+        try:
             self._save()
+        except Exception:
+            raise
+        return True
 
 
 class ComboProvider(BaseProvider):
-    def __init__(self, combo_name: str, combo_def: Dict[str, Any], gateway_config: Optional[Any] = None):
+    def __init__(self, combo_name: str, combo_def: Dict[str, Any], gateway_config: Optional[Any] = None, combo_manager: Optional[Any] = None):
         self.combo_name = combo_name
         self.strategy = combo_def["strategy"]
         self.models = combo_def["models"]
@@ -110,8 +261,55 @@ class ComboProvider(BaseProvider):
         self._round_robin_index = 0
         self._lock = threading.Lock()
         self._load_times: Dict[str, List[float]] = {m: [] for m in self.models}
+        # Optional shared manager for round-robin (preserves API: new param optional).
+        self._combo_manager = combo_manager
+        self._manager = combo_manager
         # Store config so _get_gateway can instantiate a valid LLMGateway
         self._gateway_config = gateway_config
+
+    def _next_round_robin_model(self) -> str:
+        """Shared round-robin slot via ComboManager (survives fresh providers)."""
+        n = len(self.models)
+        idx: Optional[int] = None
+        try:
+            mgr = getattr(self, "_combo_manager", None)
+            if mgr is None:
+                try:
+                    mgr = getattr(self, "_manager", None)
+                except Exception:
+                    mgr = None
+            if mgr is not None:
+                try:
+                    claim = getattr(mgr, "claim_round_robin", None)
+                    if callable(claim):
+                        idx = claim(self.combo_name, n)
+                except Exception:
+                    idx = None
+        except Exception:
+            idx = None
+        if idx is None:
+            try:
+                with ComboManager._shared_rr_lock:
+                    cur = ComboManager._shared_rr.get(self.combo_name, 0)
+                    ComboManager._shared_rr[self.combo_name] = cur + 1
+                    idx = cur % n
+            except Exception:
+                idx = None
+        if idx is None:
+            try:
+                with self._lock:
+                    idx = self._round_robin_index % n
+                    self._round_robin_index += 1
+            except Exception:
+                idx = getattr(self, "_round_robin_index", 0) % n
+                try:
+                    self._round_robin_index = idx + 1
+                except Exception:
+                    pass
+        try:
+            return self.models[int(idx) % n]
+        except Exception:
+            return self.models[0]
 
     def _get_gateway(self, model_id: Optional[str] = None):
         """Create a fresh LLMGateway using stored config, or build a minimal default.
@@ -382,9 +580,7 @@ class ComboProvider(BaseProvider):
             )
 
         if self.strategy == ComboStrategy.ROUND_ROBIN:
-            with self._lock:
-                model = self.models[self._round_robin_index % len(self.models)]
-                self._round_robin_index += 1
+            model = self._next_round_robin_model()
             return self._call_member(model, messages, tools)
 
         elif self.strategy == ComboStrategy.RANDOM:

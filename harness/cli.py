@@ -5,6 +5,7 @@ import asyncio
 import difflib
 import traceback
 import logging
+import threading
 from typing import Tuple, Optional, List, Callable, Dict, Any
 
 # Silence all loggers to ERROR level
@@ -156,7 +157,7 @@ class _TUIPicker:
     """
 
     VIEWPORT = 15
-    FOOTER = "↑↓/jk=pindah · huruf=cari live · Enter=pilih · Esc=batal"
+    FOOTER = "Cara pakai: ketik untuk mencari · tombol atas bawah untuk pindah · Enter untuk pilih · Esc untuk batal"
 
     def __init__(self, title="", items=None, show=None, initial="", multi=False):
         self.title = title or "Pilih"
@@ -231,7 +232,7 @@ class _TUIPicker:
         total = len(filt)
         sc = self._viewport(total)
         pos = f"▶ {self.idx + 1}/{total}" if total else "▶ 0/0"
-        lines = [_trunc(f"{self.title}  {pos}", _max), _trunc(f"🔍 {self.query}▊", _max)]
+        lines = [_trunc(f"{self.title}  {pos}", _max), _trunc(f"Cari: {self.query}▊", _max)]
         for r in range(sc, min(sc + self.VIEWPORT, total)):
             oi, it = filt[r]
             raw = str(self.label(it)).replace("\r", " ").replace("\n", " ")
@@ -247,10 +248,11 @@ class _TUIPicker:
             else:
                 lines.append(f"{pre}{num}{mark}{lab}")
         if total == 0:
-            lines.append(_trunc(f"  ✗ tidak cocok: '{self.query}'", _max))
+            lines.append(_trunc(f"  ✗ tidak cocok: '{self.query}' — coba kata lain, contoh: gemini", _max))
         if self.multi:
-            lines.append(_trunc(f"  [terpilih {len(self.selected)} · Spasi=toggle · Enter=selesai (min 1)]", _max))
-        lines.append(_trunc(self.FOOTER if not self.multi else self.FOOTER + " · Spasi=toggle", _max))
+            lines.append(_trunc(f"  [terpilih {len(self.selected)} terhitung · Spasi=Tandai · Enter=Selesai (min 1)]", _max))
+        # Footer Cara pakai JANGAN dipotong agar frasa baku utuh di semua lebar terminal.
+        lines.append(self.FOOTER if not self.multi else self.FOOTER + " · Spasi=Tandai")
         return lines
 
     def _render(self) -> None:
@@ -506,6 +508,9 @@ class CodeAICLI:
         self._providers_ts: float = 0.0
         self._models_cache = None
         self._models_ts: float = 0.0
+        self._cache_lock = threading.Lock()
+        self._spin_lock = threading.Lock()
+        self._chat_lock = threading.Lock()
         try:
             self.config = CodeAIConfig.load_from_file(self.config_path)
         except Exception:
@@ -528,9 +533,16 @@ class CodeAICLI:
         from harness.models.provider_registry import ProviderRegistry
         if getattr(self, "_reg_singleton", None) is not None:
             return self._reg_singleton
-        cp = getattr(self.config, "custom_providers", None) if self.config else None
-        self._reg_singleton = ProviderRegistry(custom_providers=cp or None)
-        return self._reg_singleton
+        try:
+            _lk = self._cache_lock
+        except AttributeError:
+            _lk = self._cache_lock = threading.Lock()
+        with _lk:
+            if getattr(self, "_reg_singleton", None) is not None:
+                return self._reg_singleton
+            cp = getattr(self.config, "custom_providers", None) if self.config else None
+            self._reg_singleton = ProviderRegistry(custom_providers=cp or None)
+            return self._reg_singleton
 
     def _run_with_timeout(self, fn, timeout: float = 1.5, fallback=None):
         """Jalankan fn() blocking di thread daemon + join(timeout); timeout → fallback."""
@@ -544,6 +556,11 @@ class CodeAICLI:
         th = threading.Thread(target=_t, daemon=True)
         th.start()
         th.join(timeout=timeout)
+        try:
+            if th.is_alive():
+                return fallback
+        except Exception:
+            pass
         if "v" in box:
             return box["v"]
         return fallback
@@ -552,12 +569,18 @@ class CodeAICLI:
         """Cache-dulu + lazy: cache segar (<30s) langsung; miss → fetch timeout, gagal → stale/[] non-blocking."""
         now = time.monotonic()
         try:
-            ttl_ok = self._providers_cache is not None and (now - float(self._providers_ts)) < 30.0
-        except Exception:
-            ttl_ok = False
-        if ttl_ok:
-            return self._providers_cache
-        stale = self._providers_cache if self._providers_cache is not None else []
+            _lk = self._cache_lock
+        except AttributeError:
+            import threading as _th0
+            _lk = self._cache_lock = _th0.Lock()
+        with _lk:
+            try:
+                ttl_ok = self._providers_cache is not None and (now - float(self._providers_ts)) < 30.0
+            except Exception:
+                ttl_ok = False
+            if ttl_ok:
+                return self._providers_cache
+            stale = self._providers_cache if self._providers_cache is not None else []
         reg = self._registry()
         res = self._run_with_timeout(reg.list_providers, timeout=timeout, fallback=None)
         if res is None:
@@ -567,28 +590,36 @@ class CodeAICLI:
                 def _bg():
                     try:
                         _v = reg.list_providers()
-                        self._providers_cache = _v
-                        self._providers_ts = time.monotonic()
+                        with _lk:
+                            self._providers_cache = _v
+                            self._providers_ts = time.monotonic()
                     except Exception:
                         pass
                 _th.Thread(target=_bg, daemon=True).start()
             except Exception:
                 pass
             return stale
-        self._providers_cache = res
-        self._providers_ts = now
+        with _lk:
+            self._providers_cache = res
+            self._providers_ts = now
         return res
 
     def _list_connected_fast(self, timeout: float = 2.0) -> list:
         """Cache-dulu untuk list_connected_models (hindari block 8s discovery); timeout → stale/[] + refresh lazy."""
         now = time.monotonic()
         try:
-            ttl_ok = self._models_cache is not None and (now - float(self._models_ts)) < 30.0
-        except Exception:
-            ttl_ok = False
-        if ttl_ok:
-            return self._models_cache
-        stale = self._models_cache if self._models_cache is not None else []
+            _lk2 = self._cache_lock
+        except AttributeError:
+            import threading as _th0b
+            _lk2 = self._cache_lock = _th0b.Lock()
+        with _lk2:
+            try:
+                ttl_ok = self._models_cache is not None and (now - float(self._models_ts)) < 30.0
+            except Exception:
+                ttl_ok = False
+            if ttl_ok:
+                return self._models_cache
+            stale = self._models_cache if self._models_cache is not None else []
         reg = self._registry()
         res = self._run_with_timeout(reg.list_connected_models, timeout=timeout, fallback=None)
         if res is None:
@@ -597,16 +628,18 @@ class CodeAICLI:
                 def _bg2():
                     try:
                         _v2 = reg.list_connected_models()
-                        self._models_cache = _v2
-                        self._models_ts = time.monotonic()
+                        with _lk2:
+                            self._models_cache = _v2
+                            self._models_ts = time.monotonic()
                     except Exception:
                         pass
                 _th2.Thread(target=_bg2, daemon=True).start()
             except Exception:
                 pass
             return stale
-        self._models_cache = res
-        self._models_ts = now
+        with _lk2:
+            self._models_cache = res
+            self._models_ts = now
         return res
 
     @staticmethod
@@ -817,6 +850,12 @@ class CodeAICLI:
         else:
             _oll_run = False
         lines: list = []
+        lines.append("Gagal menjawab")
+        try:
+            _sebab = str(_cause or "").strip() or "tidak ada rincian"
+        except Exception:
+            _sebab = "tidak ada rincian"
+        lines.append(f"Sebab: {_sebab}")
         for _pid in chain:
             try:
                 _ps = str(_pid).strip() or "?"
@@ -824,38 +863,41 @@ class CodeAICLI:
                 _ps = "?"
             if _ps == "ollama":
                 if not _oll_inst:
-                    lines.append("• ollama: skipped (not installed)")
+                    lines.append("• ollama: dilewati (belum dipasang)")
                 elif not _oll_run:
-                    lines.append("• ollama: skipped (not running — jalankan `ollama serve`)")
+                    lines.append("• ollama: dilewati (belum jalan — jalankan `ollama serve`)")
                 elif _ps == _owner:
                     if self._is_auth_like(_cause):
                         lines.append(f"• ollama: {_cause} → saran /provider ollama")
                     elif self._is_conn_like(_cause):
-                        lines.append(f"• ollama: {_cause} → cek koneksi atau /model")
+                        lines.append(f"• ollama: {_cause} → periksa sambungan atau /model")
                     else:
                         lines.append(f"• ollama: {_cause}")
                 else:
-                    lines.append("• ollama: dicoba (failover)")
+                    lines.append("• ollama: dicoba (cadangan)")
                 continue
             if _ps not in conn_set:
-                lines.append(f"• {_ps}: not connected → saran /provider {_ps}")
+                lines.append(f"• {_ps}: belum terhubung → saran /provider {_ps}")
             elif _ps == _owner:
                 if self._is_auth_like(_cause):
                     lines.append(f"• {_ps}: {_cause} → saran /provider {_ps}")
                 elif self._is_conn_like(_cause):
-                    lines.append(f"• {_ps}: {_cause} → cek koneksi atau /model")
+                    lines.append(f"• {_ps}: {_cause} → periksa sambungan atau /model")
                 else:
                     lines.append(f"• {_ps}: {_cause}")
             else:
-                lines.append(f"• {_ps}: dicoba (failover)")
+                lines.append(f"• {_ps}: dicoba (cadangan)")
         if connected:
             try:
                 _show = ", ".join(list(connected)[:5])
-                lines.append(f"Saran: /model {_show} (hanya yang CONNECTED) · /providers untuk daftar")
+                lines.append(f"Saran: /model {_show} (hanya yang Terhubung) · /providers (/daftar) untuk daftar")
             except Exception:
                 pass
         else:
-            lines.append("Saran: /provider <provider> untuk menghubungkan (lihat /providers)")
+            lines.append("Saran: /provider untuk menyambung (lihat /providers atau /daftar)")
+        lines.append("Langkah 1: ketik /provider untuk menyambung, contoh: /provider gemini")
+        lines.append("Langkah 2: ketik /model untuk memilih model yang Terhubung, contoh: /model gemini")
+        lines.append("Langkah 3: ulangi pertanyaan Anda, contoh: halo")
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -881,12 +923,12 @@ class CodeAICLI:
                 return t[:budget]
             return t[: budget - 1] + "…"
 
-        footer = "nomor=pilih · teks=filter · Enter=kembali/batal · q=batal"
-        count_line = f"… +{total - len(shown)} cocok (ketik lagi untuk filter)" if total > len(shown) else ""
+        footer = "Cara pakai: ketik untuk mencari · tombol atas bawah untuk pindah · Enter untuk pilih · Esc untuk batal"
+        count_line = f"… +{total - len(shown)} cocok (ketik lagi untuk menyaring, contoh: gemini)" if total > len(shown) else ""
         # Plain vertical writes (no Rich Table/Panel/Columns → anti-menyamping).
         try:
             sys.stdout.write(_trunc(f"── {title}", _max) + "\n")
-            sys.stdout.write(_trunc(f"🔍 {query if query else '—'}", _max) + "\n")
+            sys.stdout.write(_trunc(f"Cari: {query if query else '—'}", _max) + "\n")
             for i, label in enumerate(shown, 1):
                 pre = f"{i:2}. "
                 budget = _max - len(pre)
@@ -895,12 +937,13 @@ class CodeAICLI:
                 sys.stdout.write(pre + _trunc(label, budget) + "\n")
             if count_line:
                 sys.stdout.write(_trunc(count_line, _max) + "\n")
-            sys.stdout.write(_trunc(footer, _max) + "\n")
+            # Footer Cara pakai JANGAN dipotong agar frasa baku utuh.
+            sys.stdout.write(footer + "\n")
             sys.stdout.flush()
         except Exception:
             pass
 
-    def _popup_input(self, hint: str = "[cari?] nomor/teks (Enter=batal, q=batal)") -> Optional[str]:
+    def _popup_input(self, hint: str = "[Cari:] nomor/teks (Enter=batal, q=batal)") -> Optional[str]:
         # stdlib input() untuk kedua mode (rich hanya untuk render) agar
         # mudah di-mock via builtins.input pada pengujian.
         try:
@@ -942,7 +985,7 @@ class CodeAICLI:
             if total == 0:
                 # Tetap render popup + pesan tolak (verbatim untuk simulasi).
                 self._popup_render(title, query, [], 0)
-                _print(f"[red]✗ tidak cocok: '{query}'[/red] [dim]coba substring lain / q=batal[/dim]")
+                _print(f"[red]✗ tidak cocok: '{query}'[/red] [dim]coba kata kunci lain, contoh: gemini / q=batal[/dim]")
             else:
                 self._popup_render(title, query, shown, total)
             raw = self._popup_input()
@@ -991,7 +1034,7 @@ class CodeAICLI:
         selected: List[int] = []
         query = (initial or "").strip()
         filt = _filtered(query)
-        hint = "[cari?] 1,3/done/teks (Enter=selesai/batal, q=batal)"
+        hint = "[Cari:] 1,3/selesai/teks (Enter=Selesai/batal, q=batal)"
         while True:
             total = len(filt)
             visible_pairs = filt[:15]
@@ -1006,7 +1049,7 @@ class CodeAICLI:
                 return selected if selected else None
             if s.lower() == "q":
                 return None
-            if s.lower() == "done":
+            if s.lower() in ("done", "selesai"):
                 return selected if selected else None
             parts = [p.strip() for p in s.split(",")]
             if parts and all(p.isdigit() for p in parts):
@@ -1083,32 +1126,97 @@ class CodeAICLI:
         try:
             self.orchestrator = Orchestrator(hooks, agents, config=self.config)
         except Exception as e:
-            _print(f"[bold red]Failed to initialise orchestrator: {e}[/bold red]")
+            _print(f"[bold red]Gagal menyiapkan orchestrator: {e}[/bold red]")
             if self.verbose:
                 traceback.print_exc()
             sys.exit(1)
 
+    def _effort_id(self, eff: str = "") -> str:
+        try:
+            _m = {"low": "rendah", "medium": "sedang", "high": "tinggi"}
+            return _m.get(str(eff or "").strip().lower(), str(eff or "—"))
+        except Exception:
+            return str(eff or "—")
+
+    def _status_baku(self) -> Tuple[str, str, str]:
+        try:
+            _prov, _mod = self.get_active_info()
+        except Exception:
+            _prov, _mod = "", ""
+        try:
+            _prov = str(_prov or "").strip()
+            _mod = str(_mod or "").strip()
+        except Exception:
+            _prov, _mod = "", ""
+        try:
+            _conn = self._list_connected_fast()
+        except Exception:
+            _conn = []
+        try:
+            _total = len(list(_conn or []))
+        except Exception:
+            _total = 0
+        try:
+            _provs = self._list_providers_fast()
+            _n_conn = sum(1 for p in (_provs or []) if p.get("has_credentials"))
+        except Exception:
+            _n_conn = _total
+        _ada = bool(_total > 0 or _n_conn > 0)
+        if not _ada or not _prov or not _mod:
+            return ("○ Belum terhubung", "belum ada model", "Langkah 1: ketik /provider")
+        try:
+            _ids = [str(m.get("id", "")) for m in (_conn or [])]
+        except Exception:
+            _ids = []
+        try:
+            _aktif = f"{_prov}/{_mod}" if "/" not in str(_mod) else str(_mod)
+        except Exception:
+            _aktif = f"{_prov}/{_mod}"
+        _pos = 0
+        try:
+            if _aktif in _ids:
+                _pos = _ids.index(_aktif) + 1
+            else:
+                for _i, _m in enumerate(_conn or []):
+                    try:
+                        if str(_m.get("provider", "")).strip() == _prov:
+                            _pos = _i + 1
+                            break
+                    except Exception:
+                        continue
+                if _pos == 0:
+                    _pos = 1
+        except Exception:
+            _pos = 1
+        try:
+            _tot = _total if _total else max(1, _n_conn)
+        except Exception:
+            _tot = 1
+        return (f"● Terhubung", f"{_prov}/{self._short(_mod)}", f"Model {_pos} dari {_tot}")
+
     def display_banner(self):
-        # Slim 2-line banner (max 2 rows).
+        # Banner 2 baris informatif: status DULU, lalu label model, lalu posisi.
         provider, model = self.get_active_info()
         agents_exists = os.path.exists("AGENTS.md")
         hooks_exists = os.path.exists("SYSTEM_HOOKS.md")
         try:
-            provs = self._list_providers_fast()
-            n_conn = sum(1 for p in provs if p.get("has_credentials"))
+            _st, _lbl, _pos = self._status_baku()
         except Exception:
-            n_conn = 0
+            _st, _lbl, _pos = ("○ Belum terhubung", "belum ada model", "Langkah 1: ketik /provider")
         ag = "ON" if agents_exists else "off"
         hk = "ON" if hooks_exists else "off"
-        eff = getattr(getattr(self.config, "provider", None), "effort", None) or "—"
+        try:
+            _eff_raw = getattr(getattr(self.config, "provider", None), "effort", None) or "—"
+        except Exception:
+            _eff_raw = "—"
+        eff = self._effort_id(_eff_raw) if _eff_raw != "—" else "—"
         el = f"{self._last_elapsed:.1f}s" if getattr(self, "_last_elapsed", None) else "—"
-        short = self._short(model)
         if RICH_AVAILABLE:
-            console.print(f"[bold blue]CodeAI Harness[/bold blue] [dim]v0.1.0[/dim]  [cyan]{provider}[/cyan]/[yellow]{short}[/yellow]  [dim]{n_conn} connected · {eff} · {el}[/dim]")
-            console.print(f"  [dim]AGENTS:{ag} HOOKS:{hk}  │  /help /model /provider /combo /quit  (Ctrl-C steer)[/dim]")
+            console.print(f"[bold blue]CodeAI Harness[/bold blue] [dim]v0.1.0[/dim]  {_st} — {_lbl} — {_pos}")
+            console.print(f"  [dim]AGENTS:{ag} HOOKS:{hk} · Kekuatan pikir:{eff} · Waktu:{el}  │  /bantuan /model /provider /combo /keluar (Ctrl-C alih)[/dim]")
         else:
-            print(f"CodeAI Harness v0.1.0  |  {provider}/{short}  |  {n_conn} connected · {eff} · {el}")
-            print(f"AGENTS:{ag} HOOKS:{hk}  |  /help /model /provider /combo /quit  (Ctrl-C steer)")
+            print(f"CodeAI Harness v0.1.0  |  {_st} — {_lbl} — {_pos}")
+            print(f"AGENTS:{ag} HOOKS:{hk} · Kekuatan pikir:{eff} · Waktu:{el}  |  /bantuan /model /provider /combo /keluar (Ctrl-C alih)")
 
     def run(self):
         self.startup()
@@ -1120,10 +1228,7 @@ class CodeAICLI:
     # ------------------------------------------------------------------
 
     def _ask_main(self) -> str:
-        # SATU box bersih: header ╭─ ❯ <provider-penuh> · <short> · <effort> ─.
-        # Provider TAMPIL PENUH (jangan via _short/AI) agar "antigravity"
-        # tak terpotong; _short hanya untuk model. Tutup ╰─. TANPA Prompt
-        # rich ganda dan TANPA hint cari (milik picker saja).
+        # Kotak pesan: status DULU, lalu label model, lalu posisi.
         try:
             _prov, _mod = self.get_active_info()
         except Exception:
@@ -1133,16 +1238,23 @@ class CodeAICLI:
         except Exception:
             _prov = "?"
         try:
-            _eff = getattr(getattr(self.config, "provider", None), "effort", None) or "—"
+            _eff_raw = getattr(getattr(self.config, "provider", None), "effort", None) or "—"
+            _eff = self._effort_id(_eff_raw) if _eff_raw != "—" else "—"
         except Exception:
             _eff = "—"
         try:
             _short = self._short(_mod)
         except Exception:
             _short = str(_mod)
-        header = f"╭─ ❯ {_prov} · {_short} · {_eff} ─"
+        try:
+            _st, _lbl, _pos = self._status_baku()
+        except Exception:
+            _st, _lbl, _pos = ("○ Belum terhubung", "belum ada model", "Langkah 1: ketik /provider")
+        header = f"╭─ ❯ {_st} — {_lbl} — {_pos} ─"
+        _petunjuk = "Ketik di sini lalu tekan Enter: pesan atau /perintah · contoh: /model gemini"
         if RICH_AVAILABLE:
-            console.print(f"[bold cyan]{header}[/bold cyan] [dim]pesan atau /perintah · cth: /model gemini[/dim]")
+            console.print("─── Tulis pesan ───")
+            console.print(f"[bold cyan]{header}[/bold cyan] [dim]{_petunjuk}[/dim]")
             try:
                 val = input("│ ❯ ")
             except (EOFError, KeyboardInterrupt):
@@ -1152,7 +1264,8 @@ class CodeAICLI:
             except Exception:
                 pass
             return val
-        print(f"{header} ─ ketik pesan atau /perintah (cth: /model gemini)")
+        print("─── Tulis pesan ───")
+        print(f"{header} ─ {_petunjuk}")
         try:
             val = input("│ ❯ ")
         except (EOFError, KeyboardInterrupt):
@@ -1175,11 +1288,11 @@ class CodeAICLI:
                     self.dispatch_task(user_input)
 
             except KeyboardInterrupt:
-                _print("\n[dim]Interrupted (Ctrl-C). Type /quit to exit or /steer <text> to redirect.[/dim]")
+                _print("\n[dim]Terhenti (Ctrl-C). Ketik /quit (/keluar) untuk keluar atau /steer (/alih) <teks> untuk mengarahkan.[/dim]")
             except EOFError:
                 break
             except Exception as e:
-                _print(f"[bold red]Error: {e}[/bold red] [dim](type /help)[/dim]")
+                _print(f"[bold red]Gagal menjawab: {e}[/bold red] [dim](ketik /bantuan)[/dim]")
                 if self.verbose:
                     traceback.print_exc()
 
@@ -1196,15 +1309,20 @@ class CodeAICLI:
             "/quit":      lambda: self._cmd_quit(),
             "/exit":      lambda: self._cmd_quit(),
             "/q":         lambda: self._cmd_quit(),
+            "/keluar":    lambda: self._cmd_quit(),
             "/status":    lambda: self.show_status(),
             "/s":         lambda: self.show_status(),
+            "/keadaan":   lambda: self.show_status(),
             "/config":    lambda: self.show_config(),
-            "/steer":     lambda: self.steer_orchestrator(args) if args else _print("[yellow]Usage: /steer <instruction>[/yellow]"),
-            "/st":        lambda: self.steer_orchestrator(args) if args else _print("[yellow]Usage: /steer <instruction>[/yellow]"),
+            "/pengaturan": lambda: self.show_config(),
+            "/steer":     lambda: self.steer_orchestrator(args) if args else _print("[yellow]Cara pakai: /steer (/alih) <perintah>[/yellow] [dim]Contoh: /steer lanjutkan[/dim]"),
+            "/st":        lambda: self.steer_orchestrator(args) if args else _print("[yellow]Cara pakai: /steer (/alih) <perintah>[/yellow] [dim]Contoh: /steer lanjutkan[/dim]"),
+            "/alih":      lambda: self.steer_orchestrator(args) if args else _print("[yellow]Cara pakai: /alih (/steer) <perintah>[/yellow] [dim]Contoh: /alih lanjutkan[/dim]"),
             "/providers": lambda: self.show_providers(args),
             "/p":         lambda: self.show_providers(args),
+            "/daftar":    lambda: self.show_providers(args),
             "/provider":  lambda: self.handle_provider(args),
-            "/models":    lambda: self.show_models(args) if args else _print("[yellow]Usage: /models <provider>[/yellow]"),
+            "/models":    lambda: self.show_models(args) if args else _print("[yellow]Cara pakai: /models <penyedia>[/yellow] [dim]Contoh: /models gemini[/dim]"),
             "/model":     lambda: self.switch_model(args),
             "/m":         lambda: self.switch_model(args),
             "/effort":    lambda: self.handle_effort(args),
@@ -1212,8 +1330,10 @@ class CodeAICLI:
             "/combo":     lambda: self.handle_combo(args),
             "/c":         lambda: self.handle_combo(args),
             "/history":   lambda: self.show_history(),
+            "/riwayat":   lambda: self.show_history(),
             "/help":      lambda: self.show_help(),
             "/h":         lambda: self.show_help(),
+            "/bantuan":   lambda: self.show_help(),
         }
 
         handler = dispatch.get(cmd)
@@ -1223,13 +1343,13 @@ class CodeAICLI:
             try:
                 _cands = list(dispatch.keys())
                 _m = difflib.get_close_matches(cmd, _cands, n=1, cutoff=0.6)
-                _hint = f"  [dim]Did you mean {_m[0]}?[/dim]" if _m else "  [dim](type /help)[/dim]"
+                _hint = f"  [dim]Mungkin maksud Anda {_m[0]}?[/dim]" if _m else "  [dim](ketik /bantuan)[/dim]"
             except Exception:
-                _hint = "  [dim](type /help)[/dim]"
-            _print(f"[red]Unknown command: {cmd}[/red]{_hint}")
+                _hint = "  [dim](ketik /bantuan)[/dim]"
+            _print(f"[red]Perintah tidak dikenal: {cmd}[/red]{_hint} [dim]Contoh: /bantuan[/dim]")
 
     def _cmd_quit(self):
-        _print("[dim]Goodbye.[/dim]")
+        _print("[dim]Sampai jumpa.[/dim]")
         sys.exit(0)
 
     # ------------------------------------------------------------------
@@ -1264,8 +1384,22 @@ class CodeAICLI:
         _tok_lock = threading.Lock()
         _tokens: List[str] = []
         _streamed = {"n": 0}
+        _done = threading.Event()
+        try:
+            _spin_lock = self._spin_lock
+        except AttributeError:
+            _spin_lock = self._spin_lock = threading.Lock()
+        try:
+            _chat_lock = self._chat_lock
+        except AttributeError:
+            _chat_lock = self._chat_lock = threading.Lock()
 
         def _on_token(tok) -> None:
+            try:
+                if _done.is_set():
+                    return
+            except Exception:
+                pass
             try:
                 t = tok if isinstance(tok, str) else str(tok)
             except Exception:
@@ -1313,37 +1447,96 @@ class CodeAICLI:
 
         def _run():
             _orig = None
+            _did_patch = False
             _gw2 = getattr(self.orchestrator, "gateway", None) if self.orchestrator else None
             try:
                 # Teruskan on_token ke gateway bila didukung; TypeError → plain.
                 if _gw2 is not None and _stream_supported and hasattr(_gw2, "chat"):
                     try:
                         import functools as _ft
-                        _orig = _gw2.chat
-
-                        @_ft.wraps(_orig)
-                        def _patched(messages, tools=None, model=None, **kw):
-                            kw.setdefault("on_token", _on_token)
+                        try:
+                            _already = bool(getattr(_gw2.chat, "_codeai_patched", False))
+                        except Exception:
+                            _already = False
+                        if _already:
+                            _orig = None
+                        else:
                             try:
-                                return _orig(messages, tools, model, **kw)
-                            except TypeError:
-                                kw.pop("on_token", None)
+                                _got_lock = _chat_lock.acquire(timeout=1.0)
+                            except Exception:
+                                _got_lock = False
+                            try:
                                 try:
-                                    return _orig(messages, tools, model, **kw)
-                                except TypeError:
-                                    if tools is not None:
-                                        return _orig(messages, tools)
-                                    return _orig(messages)
-                        _gw2.chat = _patched
+                                    _recheck = bool(getattr(_gw2.chat, "_codeai_patched", False))
+                                except Exception:
+                                    _recheck = False
+                                if _recheck:
+                                    _orig = None
+                                else:
+                                    _orig = _gw2.chat
+
+                                    @_ft.wraps(_orig)
+                                    def _patched(messages, tools=None, model=None, **kw):
+                                        kw.setdefault("on_token", _on_token)
+                                        try:
+                                            return _orig(messages, tools, model, **kw)
+                                        except TypeError:
+                                            kw.pop("on_token", None)
+                                            try:
+                                                return _orig(messages, tools, model, **kw)
+                                            except TypeError:
+                                                if tools is not None:
+                                                    return _orig(messages, tools)
+                                                return _orig(messages)
+                                    try:
+                                        _patched._codeai_patched = True
+                                    except Exception:
+                                        pass
+                                    _gw2.chat = _patched
+                                    _did_patch = True
+                            finally:
+                                try:
+                                    if _got_lock:
+                                        _chat_lock.release()
+                                except Exception:
+                                    pass
                     except Exception:
                         _orig = None
-                _box["r"] = self.orchestrator.run_task(task)
+                        _did_patch = False
+                try:
+                    if _done.is_set():
+                        return
+                except Exception:
+                    pass
+                _res = self.orchestrator.run_task(task)
+                try:
+                    if _done.is_set():
+                        return
+                except Exception:
+                    pass
+                _box["r"] = _res
             except Exception as e:
-                _box["e"] = f"❌ Task failed: {e}"
+                try:
+                    if _done.is_set():
+                        return
+                except Exception:
+                    pass
+                try:
+                    _box["e"] = f"❌ Gagal menjawab: {e}"
+                except Exception:
+                    pass
             finally:
                 try:
-                    if _gw2 is not None and _orig is not None:
-                        _gw2.chat = _orig
+                    if _gw2 is not None and _orig is not None and _did_patch:
+                        # Join worker selesai sebelum restore; kembalikan patch asli.
+                        try:
+                            if getattr(getattr(_gw2, "chat", None), "_codeai_patched", False):
+                                _gw2.chat = _orig
+                        except Exception:
+                            try:
+                                _gw2.chat = _orig
+                            except Exception:
+                                pass
                 except Exception:
                     pass
 
@@ -1355,12 +1548,13 @@ class CodeAICLI:
             # SATU Spinner dipertahankan (jangan recreate per tick — itu yang
             # membekukan animasi dots); hanya .text dimutasi (elapsed hidup).
             # Label provider PENUH (bukan "AI") + model short.
-            _spin = Spinner("dots", text=f" orchestrator thinking · {provider}/{short} · 0.0s · Ctrl-C steer", style="cyan")
+            _spin = Spinner("dots", text=f" orchestrator berpikir · {provider}/{short} · 0.0s · Ctrl-C alih", style="cyan")
 
             def _renderable():
                 _dt = time.monotonic() - t0
                 try:
-                    _spin.text = f" orchestrator thinking · {provider}/{short} · {_dt:.1f}s · Ctrl-C steer"
+                    with _spin_lock:
+                        _spin.text = f" orchestrator berpikir · {provider}/{short} · {_dt:.1f}s · Ctrl-C alih"
                 except Exception:
                     pass
                 _body = _snapshot()
@@ -1383,16 +1577,16 @@ class CodeAICLI:
                                 _live.stop()
                             except Exception:
                                 pass
-                            _print("\n[dim]Steer (tugas tetap jalan — Enter kosong = lanjut)[/dim]")
+                            _print("\n[dim]Alih (tugas tetap jalan — Enter kosong = lanjut)[/dim]")
                             try:
-                                _s = input("steer ❯ ")
+                                _s = input("alih ❯ ")
                             except (EOFError, KeyboardInterrupt):
                                 _s = ""
                             if (_s or "").strip():
                                 try:
                                     self.steer_orchestrator(_s.strip())
                                 except Exception as _se:
-                                    _print(f"[red]Steer failed: {_se}[/red]")
+                                    _print(f"[red]Gagal alih: {_se}[/red]")
                             try:
                                 _live.start()
                             except Exception:
@@ -1428,8 +1622,23 @@ class CodeAICLI:
             except Exception:
                 pass
             _th.join(timeout=5)
-            result = _box.get("r", _box.get("e", "_No response._"))
-            result = result or "_No response._"
+            try:
+                _alive = _th.is_alive()
+            except Exception:
+                _alive = False
+            try:
+                with _tok_lock:
+                    result = _box.get("r", _box.get("e", "_Tidak ada jawaban._"))
+            except Exception:
+                try:
+                    result = _box.get("r", _box.get("e", "_Tidak ada jawaban._"))
+                except Exception:
+                    result = "_Tidak ada jawaban._"
+            try:
+                _done.set()
+            except Exception:
+                pass
+            result = result or "_Tidak ada jawaban._"
             dt = time.monotonic() - t0
             self._last_elapsed = dt
             try:
@@ -1443,9 +1652,9 @@ class CodeAICLI:
                 except Exception:
                     _detail = ""
                 if _detail:
-                    _print(f"{_chk}\n{_detail}  [dim](type /help)[/dim]", style="red")
+                    _print(f"{_chk}\n{_detail}  [dim](ketik /bantuan)[/dim]", style="red")
                 else:
-                    _print(f"{_chk}  [dim](run /provider or /model — type /help)[/dim]", style="red")
+                    _print(f"{_chk}  [dim](jalankan /provider atau /model — ketik /bantuan)[/dim]", style="red")
             else:
                 try:
                     _content = result.get("content", "") if isinstance(result, dict) else str(result)
@@ -1464,10 +1673,25 @@ class CodeAICLI:
         elif RICH_AVAILABLE:
             # Rich ada tapi Live/Spinner tak tersedia → Status statis (legacy).
             # Worker sudah jalan di atas; tinggal tunggu (jangan run ulang).
-            with Status(f"[dim]orchestrator thinking · {provider}/{short} · Ctrl-C steer[/dim]", spinner="dots", spinner_style="cyan"):
-                _th.join()
-            result = _box.get("r", _box.get("e", "_No response._"))
-            result = result or "_No response._"
+            with Status(f"[dim]orchestrator berpikir · {provider}/{short} · Ctrl-C alih[/dim]", spinner="dots", spinner_style="cyan"):
+                _th.join(timeout=5)
+            try:
+                _alive2 = _th.is_alive()
+            except Exception:
+                _alive2 = False
+            try:
+                with _tok_lock:
+                    result = _box.get("r", _box.get("e", "_Tidak ada jawaban._"))
+            except Exception:
+                try:
+                    result = _box.get("r", _box.get("e", "_Tidak ada jawaban._"))
+                except Exception:
+                    result = "_Tidak ada jawaban._"
+            try:
+                _done.set()
+            except Exception:
+                pass
+            result = result or "_Tidak ada jawaban._"
             dt = time.monotonic() - t0
             self._last_elapsed = dt
             try:
@@ -1481,9 +1705,9 @@ class CodeAICLI:
                 except Exception:
                     _detail2 = ""
                 if _detail2:
-                    _print(f"{_chk2}\n{_detail2}  [dim](type /help)[/dim]", style="red")
+                    _print(f"{_chk2}\n{_detail2}  [dim](ketik /bantuan)[/dim]", style="red")
                 else:
-                    _print(f"{_chk2}  [dim](run /provider or /model — type /help)[/dim]", style="red")
+                    _print(f"{_chk2}  [dim](jalankan /provider atau /model — ketik /bantuan)[/dim]", style="red")
             else:
                 try:
                     _content2 = result.get("content", "") if isinstance(result, dict) else str(result)
@@ -1502,7 +1726,7 @@ class CodeAICLI:
         else:
             # Non-rich: ticker elapsed via \r + token mengalir inline (flush).
             # Label provider PENUH + model short.
-            print(f"orchestrator thinking · {provider}/{short} · Ctrl-C to steer …")
+            print(f"orchestrator berpikir · {provider}/{short} · Ctrl-C untuk alih …")
             _shown = {"n": 0}
             _flowing = {"on": False}
             try:
@@ -1532,19 +1756,23 @@ class CodeAICLI:
                             sys.stdout.flush()
                         except Exception:
                             pass
-                        print("Steer (tugas tetap jalan — Enter kosong = lanjut)")
+                        print("Alih (tugas tetap jalan — Enter kosong = lanjut)")
                         try:
-                            _s2 = input("steer ❯ ")
+                            _s2 = input("alih ❯ ")
                         except (EOFError, KeyboardInterrupt):
                             _s2 = ""
                         if (_s2 or "").strip():
                             try:
                                 self.steer_orchestrator(_s2.strip())
                             except Exception as _se2:
-                                print(f"Steer failed: {_se2}")
+                                print(f"Gagal alih: {_se2}")
             except Exception:
                 pass
             _th.join(timeout=5)
+            try:
+                _alive3 = _th.is_alive()
+            except Exception:
+                _alive3 = False
             # Ekor token yang tiba setelah tick terakhir → alirkan dulu.
             try:
                 with _tok_lock:
@@ -1560,7 +1788,18 @@ class CodeAICLI:
                     sys.stdout.write("\r" + " " * 24 + "\r")
             except Exception:
                 pass
-            result = _box.get("r", _box.get("e", "No response."))
+            try:
+                with _tok_lock:
+                    result = _box.get("r", _box.get("e", "Tidak ada jawaban."))
+            except Exception:
+                try:
+                    result = _box.get("r", _box.get("e", "Tidak ada jawaban."))
+                except Exception:
+                    result = "Tidak ada jawaban."
+            try:
+                _done.set()
+            except Exception:
+                pass
             dt = time.monotonic() - t0
             self._last_elapsed = dt
             try:
@@ -1573,9 +1812,9 @@ class CodeAICLI:
                 except Exception:
                     _detail3 = ""
                 if _detail3:
-                    print(f"\n─── Error ───\n{_chk3}\n{_detail3}\n[{dt:.1f}s]")
+                    print(f"\n─── Gagal menjawab ───\n{_chk3}\n{_detail3}\n[{dt:.1f}s]")
                 else:
-                    print(f"\n─── Error ───\n{_chk3}  (run /provider or /model — type /help)\n[{dt:.1f}s]")
+                    print(f"\n─── Gagal menjawab ───\n{_chk3}  (jalankan /provider atau /model — ketik /bantuan)\n[{dt:.1f}s]")
             elif _shown["n"] > 0:
                 # Jawaban sudah mengalir live → cukup footer elapsed.
                 print(f"\n─ {provider} ◆ · {short} · {dt:.1f}s ─ (selesai)")
@@ -1634,8 +1873,8 @@ class CodeAICLI:
                 ]
                 items = [{"id": k, "label": f"{k} — {d}", "has_credentials": False} for k, d in options]
             else:
-                items = [{"id": p["id"], "label": f"{p['id']} {'✅ connected' if p.get('has_credentials') else '○ not connected'} — {p.get('name', '')}", "has_credentials": bool(p.get("has_credentials"))} for p in provs]
-            _pick = self._tui_pick("Login — pilih provider", items, show=lambda x: x["label"], initial="")
+                items = [{"id": p["id"], "label": f"{'● Terhubung' if p.get('has_credentials') else '○ Belum terhubung'} — {p['id']} — {p.get('name', '')}", "has_credentials": bool(p.get("has_credentials"))} for p in provs]
+            _pick = self._tui_pick("Penyedia — pilih", items, show=lambda x: x["label"], initial="")
             if _pick is None:
                 _print("[dim]Dibatalkan.[/dim]")
                 return
@@ -1647,17 +1886,17 @@ class CodeAICLI:
         # Direct-arg guard (filter :955): tolak pseudo-provider combo (api==local).
         _pn = (provider_name or "").lower().strip()
         if _pn == "combo" or _pn.startswith("combo/"):
-            _print("[red]Pilih provider asli, bukan combo[/red] [dim](combo dipakai via /model combo/<nama>)[/dim]")
+            _print("[red]Itu gabungan bukan penyedia[/red] [dim](gabungan dipakai via /model combo/<nama>, contoh: /model combo/andalan)[/dim]")
             return
         try:
             _desc = self._registry().get_provider_descriptor(_pn)
             if _desc is not None and str(_desc.get("api", "")) == "local":
-                _print("[red]Pilih provider asli, bukan combo[/red] [dim](combo dipakai via /model combo/<nama>)[/dim]")
+                _print("[red]Itu gabungan bukan penyedia[/red] [dim](gabungan dipakai via /model combo/<nama>, contoh: /model combo/andalan)[/dim]")
                 return
         except Exception:
             pass
 
-        _print(f"\n[cyan]Connecting to {provider_name}…[/cyan]")
+        _print(f"\n[cyan]Menyambung ke {provider_name}…[/cyan]")
 
         # ---- Antigravity (agy CLI, OAuth session) ----
         if provider_name == "antigravity":
@@ -1669,10 +1908,10 @@ class CodeAICLI:
                 from harness.models.providers.copilot import CopilotProvider
                 prov = CopilotProvider()
                 prov.device_flow_login()
-                _print("[bold green]✅ Copilot authenticated.[/bold green]")
+                _print("[bold green]✅ Copilot Terhubung.[/bold green]")
                 self._ask_switch_provider("copilot", PROVIDER_DEFAULT_MODELS.get("copilot", lambda: "gpt-4o")())
             except Exception as e:
-                _print(f"[bold red]Login failed: {e}[/bold red]")
+                _print(f"[bold red]Gagal masuk: {e}[/bold red] [dim]Contoh: /provider copilot[/dim]")
 
         # ---- Gemini API (AI Studio API key) ----
         elif provider_name == "gemini":
@@ -1680,13 +1919,13 @@ class CodeAICLI:
 
         # ---- Generic API key providers ----
         else:
-            vault_token = Prompt.ask(f"Enter {provider_name} API key") if RICH_AVAILABLE else input(f"{provider_name} API key: ")
+            vault_token = Prompt.ask(f"Masukkan kunci API {provider_name}") if RICH_AVAILABLE else input(f"Masukkan kunci API {provider_name}: ")
             vault_token = vault_token.strip()
             if vault_token:
                 from harness.models.auth_vault import AuthVault
                 AuthVault().store_token(provider_name, vault_token)
                 default_model = PROVIDER_DEFAULT_MODELS.get(provider_name, lambda: "default")()
-                _print(f"[bold green]✅ {provider_name} credentials saved.[/bold green]")
+                _print(f"[bold green]✅ {provider_name} tersimpan.[/bold green]")
                 self._ask_switch_provider(provider_name, default_model)
 
     def _login_antigravity(self):
@@ -1730,10 +1969,10 @@ class CodeAICLI:
                 pass
             _em0 = _safe_email()
             if _em0:
-                _print(f"[green]✅ Existing Antigravity session detected ({_em0}).[/green]")
+                _print(f"[green]✅ Sesi Antigravity lama ditemukan ({_em0}).[/green]")
             else:
-                _print("[green]✅ Existing Antigravity session detected.[/green]")
-            _print(f"[bold green]✅ Antigravity connected. Default model: {DEFAULT_ANTIGRAVITY_MODEL}[/bold green]")
+                _print("[green]✅ Sesi Antigravity lama ditemukan.[/green]")
+            _print(f"[bold green]✅ Antigravity Terhubung. Model bawaan: {DEFAULT_ANTIGRAVITY_MODEL}[/bold green]")
             try:
                 self._ask_switch_provider("antigravity", DEFAULT_ANTIGRAVITY_MODEL)
             except Exception:
@@ -1742,10 +1981,10 @@ class CodeAICLI:
         if _stored:
             _em0b = _safe_email()
             if _em0b:
-                _print(f"[green]✅ Existing Antigravity session detected ({_em0b}).[/green]")
+                _print(f"[green]✅ Sesi Antigravity lama ditemukan ({_em0b}).[/green]")
             else:
-                _print("[green]✅ Existing Antigravity session detected.[/green]")
-            _print(f"[bold green]✅ Antigravity connected. Default model: {DEFAULT_ANTIGRAVITY_MODEL}[/bold green]")
+                _print("[green]✅ Sesi Antigravity lama ditemukan.[/green]")
+            _print(f"[bold green]✅ Antigravity Terhubung. Model bawaan: {DEFAULT_ANTIGRAVITY_MODEL}[/bold green]")
             try:
                 self._ask_switch_provider("antigravity", DEFAULT_ANTIGRAVITY_MODEL)
             except Exception:
@@ -1776,8 +2015,8 @@ class CodeAICLI:
             _cid, _csec = "", ""
         _missing_creds = (not _cid or not _csec)
         if _missing_creds:
-            _print("[yellow]GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET belum diset — OAuth exchange kemungkinan gagal.[/yellow]")
-            _print("[dim]Set env GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET, atau login via `agy` sekali lalu ulangi /provider antigravity.[/dim]")
+            _print("[yellow]GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET belum diset — pertukaran OAuth kemungkinan Gagal.[/yellow]")
+            _print("[dim]Isi env GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET, atau masuk via `agy` sekali lalu ulangi /provider antigravity.[/dim]")
 
         # (b) Google OAuth intercept → dict/str creds → store → project.
         _creds = None
@@ -1794,15 +2033,15 @@ class CodeAICLI:
                 _intercept_error = str(e or "").strip()
             except Exception:
                 _intercept_error = ""
-            _print("[red]OAuth intercept gagal.[/red]")
+            _print("[red]Gagal intersep OAuth.[/red]")
             if _missing_creds or "client" in _intercept_error.lower() or "secret" in _intercept_error.lower() or "exchange" in _intercept_error.lower():
-                _print("[dim]Set GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET, atau login via `agy` sekali lalu ulangi /provider antigravity.[/dim]")
+                _print("[dim]Isi GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET, atau masuk via `agy` sekali lalu ulangi /provider antigravity.[/dim]")
             _creds = None
 
         # (c) intercept None (user batal/timeout) → pesan batal jelas, lalu fallback (e).
         if _creds is None:
             if not _intercept_error:
-                _print("[yellow]Login dibatalkan (timeout/pengguna membatalkan di browser).[/yellow]")
+                _print("[yellow]Masuk Dibatalkan (waktu habis/pengguna membatalkan di peramban).[/yellow]")
             # (e) fallback terakhir: baca sesi agy (mungkin dibuat selama window OAuth).
             try:
                 _fb = vault.discover_antigravity_token()
@@ -1813,16 +2052,16 @@ class CodeAICLI:
                     vault.store_token("antigravity", _fb)
                 except Exception:
                     pass
-                _print(f"[bold green]✅ Antigravity connected. Default model: {DEFAULT_ANTIGRAVITY_MODEL}[/bold green]")
+                _print(f"[bold green]✅ Antigravity Terhubung. Model bawaan: {DEFAULT_ANTIGRAVITY_MODEL}[/bold green]")
                 try:
                     self._ask_switch_provider("antigravity", DEFAULT_ANTIGRAVITY_MODEL)
                 except Exception:
                     pass
                 return
             if _intercept_error:
-                _print("[dim]Tidak ada sesi agy fallback. Jalankan `agy` untuk login lalu ulangi /provider antigravity, atau ulangi OAuth setelah set client creds.[/dim]")
+                _print("[dim]Tidak ada sesi agy cadangan. Jalankan `agy` untuk masuk lalu ulangi /provider antigravity, atau ulangi OAuth setelah isi client creds.[/dim]")
             else:
-                _print("[dim]Tidak ada sesi agy fallback. Jalankan `agy` untuk login lalu ulangi /provider antigravity, atau ulangi OAuth.[/dim]")
+                _print("[dim]Tidak ada sesi agy cadangan. Jalankan `agy` untuk masuk lalu ulangi /provider antigravity, atau ulangi OAuth.[/dim]")
             return
 
         # Normalisasi creds: dict (baru) atau str (lama). Masking: tak pernah print token.
@@ -1865,8 +2104,8 @@ class CodeAICLI:
             _access = ""
         if not _access:
             # (d) exchange gagal/creds kosong → instruksi, JANGAN crash → fallback (e).
-            _print("[red]OAuth exchange gagal (creds kosong).[/red]")
-            _print("[dim]Set GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET, atau login via `agy` sekali lalu ulangi /provider antigravity.[/dim]")
+            _print("[red]Gagal pertukaran OAuth (kredensial kosong).[/red]")
+            _print("[dim]Isi GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET, atau masuk via `agy` sekali lalu ulangi /provider antigravity.[/dim]")
             try:
                 _fb2 = vault.discover_antigravity_token()
             except Exception:
@@ -1876,13 +2115,13 @@ class CodeAICLI:
                     vault.store_token("antigravity", _fb2)
                 except Exception:
                     pass
-                _print(f"[bold green]✅ Antigravity connected. Default model: {DEFAULT_ANTIGRAVITY_MODEL}[/bold green]")
+                _print(f"[bold green]✅ Antigravity Terhubung. Model bawaan: {DEFAULT_ANTIGRAVITY_MODEL}[/bold green]")
                 try:
                     self._ask_switch_provider("antigravity", DEFAULT_ANTIGRAVITY_MODEL)
                 except Exception:
                     pass
                 return
-            _print("[dim]Tidak ada sesi agy fallback. Jalankan `agy` untuk login lalu ulangi /provider antigravity.[/dim]")
+            _print("[dim]Tidak ada sesi agy cadangan. Jalankan `agy` untuk masuk lalu ulangi /provider antigravity.[/dim]")
             return
 
         # Simpan OAuth: prefer store_antigravity_oauth bila ada, else store_oauth.
@@ -1939,9 +2178,9 @@ class CodeAICLI:
         # Sukses → pesan verbatim + tawar switch. Hanya email/status, tanpa token.
         _shown_email = _email or _safe_email()
         if _shown_email:
-            _print(f"[bold green]✅ Antigravity connected via Google OAuth ({_shown_email})[/bold green]")
+            _print(f"[bold green]✅ Antigravity Terhubung via Google OAuth ({_shown_email})[/bold green]")
         else:
-            _print("[bold green]✅ Antigravity connected via Google OAuth[/bold green]")
+            _print("[bold green]✅ Antigravity Terhubung via Google OAuth[/bold green]")
         try:
             self._ask_switch_provider("antigravity", DEFAULT_ANTIGRAVITY_MODEL)
         except Exception:
@@ -1953,23 +2192,23 @@ class CodeAICLI:
         from harness.models.auth_vault import AuthVault
         vault = AuthVault()
 
-        _print("[dim]Gemini API (Google AI Studio) — for gemini-2.5-flash, gemini-2.5-pro, etc.[/dim]")
-        _print("[dim]For Antigravity models (gemini-3.8, claude, gpt-oss) use /provider antigravity instead.[/dim]")
-        _print("[dim]Opening https://aistudio.google.com/app/apikey …[/dim]")
+        _print("[dim]Gemini API (Google AI Studio) — untuk gemini-2.5-flash, gemini-2.5-pro, dan lain-lain.[/dim]")
+        _print("[dim]Untuk model Antigravity (gemini-3.8, claude, gpt-oss) pakai /provider antigravity.[/dim]")
+        _print("[dim]Membuka https://aistudio.google.com/app/apikey …[/dim]")
 
         try:
             webbrowser.open("https://aistudio.google.com/app/apikey")
         except Exception:
             pass
 
-        token = Prompt.ask("Paste API key") if RICH_AVAILABLE else input("API key: ")
+        token = Prompt.ask("Tempel kunci API") if RICH_AVAILABLE else input("Kunci API: ")
         token = token.strip()
         if token:
             vault.store_token("gemini", token)
-            _print("[bold green]✅ Gemini API Key saved.[/bold green]")
+            _print("[bold green]✅ Kunci API Gemini tersimpan.[/bold green]")
             self._ask_switch_provider("gemini", "gemini-2.5-flash")
         else:
-            _print("[yellow]No key entered — cancelled.[/yellow]")
+            _print("[yellow]Tidak ada kunci — Dibatalkan.[/yellow]")
 
     def _persist_config(self) -> None:
         """Persist provider.default+active_model+effort to config_path (atomic, never crash)."""
@@ -2091,18 +2330,18 @@ class CodeAICLI:
 
         if RICH_AVAILABLE:
             sw = Prompt.ask(
-                f"Switch active provider to [cyan]{provider}[/cyan] / [yellow]{model}[/yellow]?",
+                f"Pindah ke penyedia aktif [cyan]{provider}[/cyan] / [yellow]{model}[/yellow]? Contoh: y",
                 choices=["y", "n"],
                 default="n",
             )
         else:
-            sw = input(f"Switch to {provider}/{model}? [y/N]: ").strip().lower()
+            sw = input(f"Pindah ke {provider}/{model}? Contoh y [y/N]: ").strip().lower()
 
         if sw == "y":
             self._set_active_provider(provider, model)
-            _print(f"[green]Now using [bold]{provider}[/bold] / [bold]{model}[/bold][/green]")
+            _print(f"[green]Kini memakai [bold]{provider}[/bold] / [bold]{model}[/bold][/green]")
         else:
-            _print(f"[dim]Credentials saved. Still using {current_provider}. Run /model to switch anytime.[/dim]")
+            _print(f"[dim]Tersimpan. Masih memakai {current_provider}. Jalankan /model untuk pindah kapan saja. Contoh: /model gemini[/dim]")
 
     # ------------------------------------------------------------------
     # /providers
@@ -2113,25 +2352,29 @@ class CodeAICLI:
         q = (filter_q or "").strip().lower()
         if q:
             providers = [p for p in providers if q in p["id"].lower() or q in str(p.get("name", "")).lower()]
+        try:
+            _st0, _lbl0, _pos0 = self._status_baku()
+        except Exception:
+            _st0, _lbl0, _pos0 = ("○ Belum terhubung", "belum ada model", "Langkah 1: ketik /provider")
 
         if RICH_AVAILABLE:
-            table = Table(title=f"Providers 🔍 {filter_q.strip() if filter_q.strip() else '—'}", show_header=True, header_style="bold blue")
+            table = Table(title=f"Penyedia Cari: {filter_q.strip() if filter_q.strip() else '—'} — {_st0} — {_lbl0} — {_pos0}", show_header=True, header_style="bold blue")
+            table.add_column("Status", style="green", no_wrap=True)
             table.add_column("ID", style="cyan", no_wrap=True)
-            table.add_column("Name")
-            table.add_column("Status")
+            table.add_column("Nama")
             for p in providers:
-                status = "[green]✅ Connected[/green]" if p["has_credentials"] else "[dim]○ Not connected[/dim]"
-                table.add_row(p["id"], p.get("name", p["id"]), status)
+                status = "[green]● Terhubung[/green]" if p["has_credentials"] else "[dim]○ Belum terhubung[/dim]"
+                table.add_row(status, p["id"], p.get("name", p["id"]))
             console.print()
             console.print(table)
-            console.print("[dim]nomor=pilih - teks=filter - /providers teks untuk filter[/dim]")
+            console.print("[dim]Cara pakai: nomor=pilih · teks=Saring · /providers (/daftar) teks untuk menyaring · contoh: /providers gemini[/dim]")
             console.print()
         else:
-            print(f"\n╭─ Providers 🔍 {filter_q.strip() if filter_q.strip() else '—'} ─" + "─" * 20 + "╮")
+            print(f"\n╭─ Penyedia Cari: {filter_q.strip() if filter_q.strip() else '—'} — {_st0} — {_lbl0} — {_pos0} ─" + "─" * 20 + "╮")
             for p in providers:
-                s = "✅" if p["has_credentials"] else "○"
-                print(f"│   {s} {p['id']} ({p.get('name', '')})")
-            print("│ nomor=pilih - teks=filter - /providers teks untuk filter")
+                s = "● Terhubung" if p["has_credentials"] else "○ Belum terhubung"
+                print(f"│   {s} — {p['id']} ({p.get('name', '')})")
+            print("│ Cara pakai: nomor=pilih · teks=Saring · /providers (/daftar) teks untuk menyaring · contoh: /providers gemini")
             print("╰" + "─" * 40 + "╯\n")
 
     # ------------------------------------------------------------------
@@ -2141,13 +2384,18 @@ class CodeAICLI:
     def show_models(self, provider_id: str):
         registry = self._registry()
         models = registry.list_models(provider_id)
+        try:
+            _st0, _lbl0, _pos0 = self._status_baku()
+        except Exception:
+            _st0, _lbl0, _pos0 = ("○ Belum terhubung", "belum ada model", "Langkah 1: ketik /provider")
         if not models:
-            _print(f"[yellow]No models found for '{provider_id}'.[/yellow]")
+            _print(f"[yellow]Tidak ada model untuk '{provider_id}'.[/yellow] [dim]{_st0} — {_lbl0} — {_pos0} · Contoh: /model gemini[/dim]")
             return
-        _print(f"\n[bold]Models for {provider_id}:[/bold]")
-        for m in models:
-            _print(f"  [cyan]{m}[/cyan]")
-        _print()
+        _print(f"\n[bold]{_st0} — {_lbl0} — {_pos0}[/bold]")
+        _print(f"[bold]Model untuk {provider_id}:[/bold] [dim]Cari: ketik kata kunci · contoh: gemini[/dim]")
+        for i, m in enumerate(models, 1):
+            _print(f"  [cyan]{i}. {m}[/cyan]")
+        _print(f"[dim]Cara pakai: ketik untuk mencari · tombol atas bawah untuk pindah · Enter untuk pilih · Esc untuk batal · contoh: /model {provider_id}[/dim]")
 
     # ------------------------------------------------------------------
     # /provider (auth unified builtin+custom, stdlib only)
@@ -2176,8 +2424,8 @@ class CodeAICLI:
             if not provs:
                 self._provider_list()
                 return
-            items = [{"id": p["id"], "label": f"{p['id']} {'✅ connected' if p.get('has_credentials') else '○ not connected'} — {p.get('name', '')}", "has_credentials": bool(p.get("has_credentials"))} for p in provs]
-            _pick = self._tui_pick("Provider — pilih", items, show=lambda x: x["label"], initial="")
+            items = [{"id": p["id"], "label": f"{'● Terhubung' if p.get('has_credentials') else '○ Belum terhubung'} — {p['id']} — {p.get('name', '')}", "has_credentials": bool(p.get("has_credentials"))} for p in provs]
+            _pick = self._tui_pick("Penyedia — pilih", items, show=lambda x: x["label"], initial="")
             if _pick is None:
                 _print("[dim]Dibatalkan.[/dim]")
                 return
@@ -2229,11 +2477,11 @@ class CodeAICLI:
         if _actual is not None:
             self._auth_provider(_actual)
             return
-        _print(f"[red]Unknown provider '{_want}'.[/red] [dim](lihat /provider list)[/dim]")
+        _print(f"[red]Penyedia tidak dikenal '{_want}'.[/red] [dim](lihat /provider list, contoh: /provider gemini)[/dim]")
         self._provider_list()
         return
 
-    def _provider_prompt_secret(self, prompt_text: str = "API key (opsional, Enter=kosong): ") -> str:
+    def _provider_prompt_secret(self, prompt_text: str = "Kunci API (opsional, Enter=kosong): ") -> str:
         """Minta api key tersembunyi (tak pernah echo/log). Stdlib getpass dulu."""
         try:
             import getpass as _gp
@@ -2353,16 +2601,16 @@ class CodeAICLI:
                     "sambanova", "opencode", "combo"}
         # --- id ---
         try:
-            _raw_pid = (Prompt.ask("Provider id [a-z0-9-]") if RICH_AVAILABLE else input("Provider id [a-z0-9-]: "))
+            _raw_pid = (Prompt.ask("ID penyedia [a-z0-9-], contoh: my-provider") if RICH_AVAILABLE else input("ID penyedia [a-z0-9-], contoh: my-provider: "))
         except (EOFError, KeyboardInterrupt):
             _print("[dim]Dibatalkan.[/dim]")
             return
         _pid = (_raw_pid or "").strip()
         if not _pid or not _re.match(r"^[a-z0-9-]+$", _pid):
-            _print("[red]ID tidak valid.[/red] [dim]Gunakan format [a-z0-9-] huruf-kecil/angka/strip, cth: my-provider[/dim]")
+            _print("[red]ID tidak valid.[/red] [dim]Gunakan format [a-z0-9-] huruf-kecil/angka/strip, contoh: my-provider[/dim]")
             return
         if _pid in _BUILTIN:
-            _print(f"[red]ID '{_pid}' adalah provider bawaan.[/red] [dim]Pilih id lain (builtin tak bisa ditimpa).[/dim]")
+            _print(f"[red]ID '{_pid}' adalah penyedia bawaan.[/red] [dim]Pilih id lain (bawaan tak bisa ditimpa).[/dim]")
             return
         try:
             _reg0 = self._registry()
@@ -2392,7 +2640,7 @@ class CodeAICLI:
             pass
         # --- baseURL ---
         try:
-            _raw_base = (Prompt.ask("Base URL (https://…/v1)") if RICH_AVAILABLE else input("Base URL (https://…/v1): "))
+            _raw_base = (Prompt.ask("Alamat dasar (https://…/v1), contoh: https://api.example.com/v1") if RICH_AVAILABLE else input("Alamat dasar (https://…/v1), contoh: https://api.example.com/v1: "))
         except (EOFError, KeyboardInterrupt):
             _print("[dim]Dibatalkan.[/dim]")
             return
@@ -2405,10 +2653,10 @@ class CodeAICLI:
         except Exception:
             _ok_url = False
         if not _ok_url:
-            _print("[red]Base URL tidak valid.[/red] [dim]Harus http(s)://host… cth: https://api.example.com/v1[/dim]")
+            _print("[red]Alamat dasar tidak valid.[/red] [dim]Harus http(s)://host… contoh: https://api.example.com/v1[/dim]")
             return
         # --- api key opsional (tersembunyi) ---
-        _key = self._provider_prompt_secret("API key (opsional, Enter=kosong): ")
+        _key = self._provider_prompt_secret("Kunci API (opsional, Enter=kosong): ")
         # --- models: auto discovery → manual fallback ---
         _models: list = []
         try:
@@ -2417,12 +2665,12 @@ class CodeAICLI:
             _fetched, _ferr = [], "fetch failed"
         if _fetched:
             _models = list(_fetched)
-            _print(f"[green]Discovered {len(_models)} models.[/green]")
+            _print(f"[green]Ditemukan {len(_models)} model. Contoh: {_models[0]}[/green]")
         else:
             if _ferr:
-                _print(f"[dim]Auto-discovery gagal ({_ferr}) — isi manual atau kosongkan.[/dim]")
+                _print(f"[dim]Cari otomatis Gagal ({_ferr}) — isi manual atau kosongkan. Contoh: model-a,model-b[/dim]")
             try:
-                _raw_m = (Prompt.ask("Models koma (kosong=discovery menyusul)", default="") if RICH_AVAILABLE else input("Models koma (kosong=discovery menyusul): "))
+                _raw_m = (Prompt.ask("Model koma (kosong=menyusul), contoh: model-a,model-b", default="") if RICH_AVAILABLE else input("Model koma (kosong=menyusul), contoh: model-a,model-b: "))
             except (EOFError, KeyboardInterrupt):
                 _print("[dim]Dibatalkan.[/dim]")
                 return
@@ -2435,9 +2683,9 @@ class CodeAICLI:
         try:
             _ok_conn, _cerr = self._provider_test_connection(_base, _key, timeout=10.0)
         except Exception:
-            _ok_conn, _cerr = False, "connection test failed"
+            _ok_conn, _cerr = False, "tes sambungan Gagal"
         if not _ok_conn:
-            _print(f"[red]Tes koneksi gagal: {_cerr}[/red] [dim]Periksa Base URL/jaringan. Dibatalkan, tidak disimpan.[/dim]")
+            _print(f"[red]Tes sambungan Gagal: {_cerr}[/red] [dim]Periksa alamat dasar/jaringan. Dibatalkan, tidak disimpan.[/dim]")
             return
         # --- sukses → simpan ---
         try:
@@ -2464,25 +2712,30 @@ class CodeAICLI:
                 except Exception:
                     pass
             try:
-                self._providers_cache = None
-                self._providers_ts = 0.0
-                self._models_cache = None
-                self._models_ts = 0.0
+                try:
+                    _lk_inv = self._cache_lock
+                except AttributeError:
+                    _lk_inv = self._cache_lock = threading.Lock()
+                with _lk_inv:
+                    self._providers_cache = None
+                    self._providers_ts = 0.0
+                    self._models_cache = None
+                    self._models_ts = 0.0
             except Exception:
                 pass
         except Exception as _e:
-            _print(f"[red]Gagal menyimpan provider: {_e}[/red]")
+            _print(f"[red]Gagal menyimpan penyedia: {_e}[/red]")
             return
-        _print(f"[bold green]✅ Provider '{_pid}' tersimpan.[/bold green] [dim]({len(_models)} models)[/dim]")
+        _print(f"[bold green]✅ Penyedia '{_pid}' tersimpan.[/bold green] [dim]({len(_models)} model)[/dim]")
         try:
             if _models:
                 self._set_active_provider(_pid, _models[0])
-                _print(f"✅ {_pid}/{_models[0]} aktif — langsung bisa chat.")
+                _print(f"✅ {_pid}/{_models[0]} aktif — langsung bisa chat. Contoh: halo")
             else:
                 self._set_active_provider(_pid, "")
-                _print(f"✅ {_pid}/ aktif — langsung bisa chat. [dim]Run /model {_pid}/<nama> setelah discovery, atau /provider list untuk cek.[/dim]")
+                _print(f"✅ {_pid}/ aktif — langsung bisa chat. [dim]Jalankan /model {_pid}/<nama> setelah discovery, atau /provider list untuk cek. Contoh: /model {_pid}/[/dim]")
         except Exception:
-            _print(f"[dim]Tersimpan. Gunakan /model {_pid}/<nama> untuk switch.[/dim]")
+            _print(f"[dim]Tersimpan. Gunakan /model {_pid}/<nama> untuk pindah. Contoh: /model {_pid}/[/dim]")
 
     def _provider_list(self) -> None:
         try:
@@ -2501,7 +2754,7 @@ class CodeAICLI:
                     continue
                 _name = str(_p.get("name", _pid))
                 _has = bool(_p.get("has_credentials"))
-                _status = "✅ Connected" if _has else "○ Not connected"
+                _status = "● Terhubung" if _has else "○ Belum terhubung"
                 _api = ""
                 _n = 0
                 try:
@@ -2526,30 +2779,30 @@ class CodeAICLI:
             except Exception:
                 continue
         if RICH_AVAILABLE:
-            table = Table(title="Providers (custom via /provider add)", show_header=True, header_style="bold blue")
+            table = Table(title="Penyedia (kustom via /provider add)", show_header=True, header_style="bold blue")
             table.add_column("ID", style="cyan", no_wrap=True)
-            table.add_column("Name")
+            table.add_column("Nama")
             table.add_column("BaseURL", no_wrap=True)
-            table.add_column("Models", justify="right")
+            table.add_column("Model", justify="right")
             table.add_column("Status")
             for _pid, _name, _api_s, _n, _st in _rows:
-                table.add_row(_pid, _name, _api_s or "—", str(_n), f"[green]{_st}[/green]" if "✅" in _st else f"[dim]{_st}[/dim]")
+                table.add_row(_pid, _name, _api_s or "—", str(_n), f"[green]{_st}[/green]" if "●" in _st else f"[dim]{_st}[/dim]")
             console.print()
             console.print(table)
-            console.print("[dim]/provider add · /provider remove <id> · /model untuk switch[/dim]")
+            console.print("[dim]Cara pakai: /provider add · /provider remove <id> · /model untuk pindah · contoh: /provider list[/dim]")
             console.print()
         else:
-            print("\n── Providers (custom via /provider add) ──")
+            print("\n── Penyedia (kustom via /provider add) ──")
             for _pid, _name, _api_s, _n, _st in _rows:
-                _mark = "✅" if "✅" in _st else "○"
-                print(f"  {_mark} {_pid} ({_name}) [{_n} models] {_api_s or ''}")
-            print("  /provider add · /provider remove <id> · /model untuk switch\n")
+                _mark = "● Terhubung" if "●" in _st else "○ Belum terhubung"
+                print(f"  {_mark} — {_pid} ({_name}) [{_n} model] {_api_s or ''}")
+            print("  Cara pakai: /provider add · /provider remove <id> · /model untuk pindah · contoh: /provider list\n")
 
     def _provider_remove(self, target: str = "") -> None:
         _pid_raw = (target or "").strip()
         if not _pid_raw:
             try:
-                _pid_raw = (Prompt.ask("Provider id to remove") if RICH_AVAILABLE else input("Provider id to remove: "))
+                _pid_raw = (Prompt.ask("ID penyedia yang dihapus, contoh: my-provider") if RICH_AVAILABLE else input("ID penyedia yang dihapus, contoh: my-provider: "))
             except (EOFError, KeyboardInterrupt):
                 _print("[dim]Dibatalkan.[/dim]")
                 return
@@ -2582,12 +2835,12 @@ class CodeAICLI:
             except Exception:
                 _desc = None
             if _desc is None:
-                _print(f"[red]Provider '{_want}' tidak ditemukan atau bukan custom.[/red] [dim](lihat /provider list)[/dim]")
+                _print(f"[red]Penyedia '{_want}' tidak ditemukan atau bukan kustom.[/red] [dim](lihat /provider list, contoh: /provider list)[/dim]")
             else:
-                _print(f"[red]Tidak bisa hapus builtin '{_check}'.[/red] [dim]Hanya custom provider yang bisa dihapus.[/dim]")
+                _print(f"[red]Tidak bisa hapus bawaan '{_check}'.[/red] [dim]Hanya penyedia kustom yang bisa dihapus.[/dim]")
             return
         try:
-            _conf = (Prompt.ask(f"Hapus custom provider '{_check}'?", choices=["y", "n"], default="n") if RICH_AVAILABLE else input(f"Hapus '{_check}'? [y/N]: "))
+            _conf = (Prompt.ask(f"Hapus penyedia kustom '{_check}'? Contoh y", choices=["y", "n"], default="n") if RICH_AVAILABLE else input(f"Hapus '{_check}'? Contoh y [y/N]: "))
         except (EOFError, KeyboardInterrupt):
             _print("[dim]Dibatalkan.[/dim]")
             return
@@ -2617,13 +2870,18 @@ class CodeAICLI:
         except Exception:
             pass
         try:
-            self._providers_cache = None
-            self._providers_ts = 0.0
-            self._models_cache = None
-            self._models_ts = 0.0
+            try:
+                _lk_inv2 = self._cache_lock
+            except AttributeError:
+                _lk_inv2 = self._cache_lock = threading.Lock()
+            with _lk_inv2:
+                self._providers_cache = None
+                self._providers_ts = 0.0
+                self._models_cache = None
+                self._models_ts = 0.0
         except Exception:
             pass
-        _print(f"[bold green]✅ Provider '{_check}' dihapus.[/bold green]")
+        _print(f"[bold green]✅ Penyedia '{_check}' dihapus.[/bold green]")
 
     # ------------------------------------------------------------------
     # /effort
@@ -2648,17 +2906,40 @@ class CodeAICLI:
                 items = sorted(items, key=lambda x: _order.get(x, 9))
             except Exception:
                 pass
-            _pick = self._tui_pick("Effort — pilih", items, show=lambda x: f"{x} ★ aktif" if x == shown else x, initial="")
+            def _eff_label(x):
+                try:
+                    _id = self._effort_id(x)
+                    _num = {"low": "1", "medium": "2", "high": "3"}.get(str(x).strip().lower(), "")
+                    _t = f"{_num} {_id}" if _num else f"{_id}"
+                    return f"{_t} ★ aktif" if x == shown else _t
+                except Exception:
+                    return str(x)
+            _pick = self._tui_pick("Kekuatan pikir — pilih (1 rendah · 2 sedang · 3 tinggi)", items, show=_eff_label, initial="")
             if _pick is None:
+                try:
+                    _shown_id = self._effort_id(shown)
+                except Exception:
+                    _shown_id = str(shown)
                 if base in EFFORT_MODELS:
-                    _print(f"[cyan]Effort:[/cyan] [bold]{shown}[/bold] [dim](model {base}-{shown})[/dim]")
+                    _print(f"[cyan]Kekuatan pikir:[/cyan] [bold]{_shown_id}[/bold] [dim](model {base}-{shown})[/dim] [dim]Contoh: /effort 2[/dim]")
                 else:
-                    _print(f"[cyan]Effort:[/cyan] [bold]{shown}[/bold] [dim](current model '{bare}' has no effort; stored default for Antigravity)[/dim]")
+                    _print(f"[cyan]Kekuatan pikir:[/cyan] [bold]{_shown_id}[/bold] [dim](model '{bare}' tanpa pilihan kekuatan; bawaan untuk Antigravity)[/dim] [dim]Contoh: /effort 2[/dim]")
                 return
             want = items[_pick]
 
+        # Terima angka 1/2/3 sebagai alias Indonesia (1 rendah 2 sedang 3 tinggi).
+        try:
+            _w0 = str(want or "").strip().lower()
+            if _w0 in ("1", "rendah"):
+                want = "low"
+            elif _w0 in ("2", "sedang"):
+                want = "medium"
+            elif _w0 in ("3", "tinggi"):
+                want = "high"
+        except Exception:
+            pass
         if want not in EFFORT_OPTIONS:
-            _print(f"[red]Invalid effort '{want}'.[/red] [dim]Use: /effort low|medium|high[/dim]")
+            _print(f"[red]Kekuatan pikir tidak dikenal '{want}'.[/red] [dim]Cara pakai: /effort 1 rendah|2 sedang|3 tinggi · contoh: /effort 2[/dim]")
             return
 
         if base in EFFORT_MODELS:
@@ -2670,7 +2951,11 @@ class CodeAICLI:
             except Exception:
                 pass
             self._set_active_provider(provider, new_model)
-            _print(f"[bold green]✓ Effort set to {want}[/bold green] [dim]({provider}/{new_model})[/dim]")
+            try:
+                _want_id = self._effort_id(want)
+            except Exception:
+                _want_id = str(want)
+            _print(f"[bold green]✓ Kekuatan pikir menjadi {_want_id}[/bold green] [dim]({provider}/{new_model})[/dim]")
         else:
             # Current model has no effort knob — remember as default for next Antigravity switch.
             if not self.config:
@@ -2685,7 +2970,11 @@ class CodeAICLI:
                     setattr(self.orchestrator.gateway.config, "effort", want)
                 except Exception:
                     pass
-            _print(f"[bold green]✓ Effort default saved: {want}[/bold green] [dim](current model '{bare}' has no effort knob)[/dim]")
+            try:
+                _want_id2 = self._effort_id(want)
+            except Exception:
+                _want_id2 = str(want)
+            _print(f"[bold green]✓ Kekuatan pikir bawaan tersimpan: {_want_id2}[/bold green] [dim](model '{bare}' tanpa pilihan kekuatan)[/dim]")
 
     # ------------------------------------------------------------------
     # /model
@@ -2754,7 +3043,7 @@ class CodeAICLI:
                 return _ids()[:n]
 
         def _reject(q: str) -> None:
-            _print(f"[red]✗ tidak cocok: '{q}'[/red] [dim]coba /model <substring>[/dim]")
+            _print(f"[red]✗ tidak cocok: '{q}'[/red] [dim]coba /model <kata kunci>, contoh: /model gemini[/dim]")
             for _c in _suggest(q, 5):
                 _print(f"  [cyan]{_c}[/cyan]")
 
@@ -2794,10 +3083,20 @@ class CodeAICLI:
                     _stored = getattr(self.config.provider, "effort", None) if self.config and self.config.provider else None
                     _def = _stored if isinstance(_stored, str) and _stored in EFFORT_OPTIONS else DEFAULT_ANTIGRAVITY_EFFORT
                     if RICH_AVAILABLE:
-                        effort_choice = Prompt.ask(f"effort [low/medium/high, default {_def}]", default=_def)
+                        effort_choice = Prompt.ask(f"pilih kekuatan pikir 1 rendah 2 sedang 3 tinggi [bawaan {_def}], contoh: 2", default=_def)
                     else:
-                        effort_choice = input(f"effort [low/medium/high, default {_def}]: ").strip() or _def
+                        effort_choice = input(f"pilih kekuatan pikir 1 rendah 2 sedang 3 tinggi [bawaan {_def}], contoh: 2: ").strip() or _def
                     effort_choice = (effort_choice or "").strip().lower()
+                    try:
+                        _ec = str(effort_choice or "").strip().lower()
+                        if _ec in ("1", "rendah"):
+                            effort_choice = "low"
+                        elif _ec in ("2", "sedang"):
+                            effort_choice = "medium"
+                        elif _ec in ("3", "tinggi"):
+                            effort_choice = "high"
+                    except Exception:
+                        pass
                     if effort_choice.isdigit() and 1 <= int(effort_choice) <= len(EFFORT_OPTIONS):
                         effort = EFFORT_OPTIONS[int(effort_choice) - 1]
                     elif effort_choice in EFFORT_OPTIONS:
@@ -2810,7 +3109,7 @@ class CodeAICLI:
                 self.orchestrator.compactor.set_active_model(f"{prov}/{mod}")
             except Exception:
                 pass
-            _print(f"\n[green]Switched to [bold]{prov}[/bold] / [bold]{mod}[/bold][/green]\n")
+            _print(f"\n[green]Pindah ke [bold]{prov}[/bold] / [bold]{mod}[/bold][/green] [dim]Contoh: halo[/dim]\n")
             try:
                 _ctx = self.orchestrator.compactor.get_context()
                 _hist = _ctx.get("active_history", []) or []
@@ -2872,7 +3171,7 @@ class CodeAICLI:
                 return
             # 0 atau banyak → TUI prefilled arg (refine live di dalam).
             _pool = connected
-            _pick = self._tui_pick("Model — pilih", _pool, show=_show_fn, initial=raw_q)
+            _pick = self._tui_pick("Model — pilih Cari: ketik kata kunci", _pool, show=_show_fn, initial=raw_q)
             if _pick is None:
                 # Batal: bila 0 cocok tampilkan REJECT verbatim, bila banyak cukup batal.
                 if len(_hits) == 0:
@@ -2884,11 +3183,11 @@ class CodeAICLI:
             return
 
         if not connected:
-            _print("[yellow]No connected providers. Run /provider to connect.[/yellow]")
+            _print("[yellow]○ Belum terhubung — belum ada model — Langkah 1: ketik /provider[/yellow] [dim]Contoh: /provider gemini[/dim]")
             return
         # Tanpa arg → TUI SEMUA connected (live filter, viewport 15 ikut highlight).
         _pool0 = connected
-        _pick0 = self._tui_pick("Model — pilih", _pool0, show=_show_fn, initial="")
+        _pick0 = self._tui_pick("Model — pilih Cari: ketik kata kunci", _pool0, show=_show_fn, initial="")
         if _pick0 is None:
             _print("[dim]Dibatalkan.[/dim]")
             return
@@ -2911,29 +3210,34 @@ class CodeAICLI:
         if _cmd == "list":
             combos = manager.list_combos()
             if not combos:
-                _print("[yellow]No combos saved.[/yellow]")
+                _print("[yellow]Belum ada gabungan tersimpan.[/yellow] [dim]Contoh: /combo create[/dim]")
                 return
             try:
                 _ap, _am = self.get_active_info()
             except Exception:
                 _ap, _am = "", ""
+            try:
+                _st0, _lbl0, _pos0 = self._status_baku()
+            except Exception:
+                _st0, _lbl0, _pos0 = ("○ Belum terhubung", "belum ada model", "Langkah 1: ketik /provider")
             if RICH_AVAILABLE:
-                table = Table(title="Combos", show_header=True, header_style="bold blue")
-                table.add_column("Name", style="cyan")
-                table.add_column("Strategy")
-                table.add_column("Models")
+                table = Table(title=f"Gabungan — {_st0} — {_lbl0} — {_pos0}", show_header=True, header_style="bold blue")
+                table.add_column("Nama", style="cyan")
+                table.add_column("Strategi")
+                table.add_column("Model")
                 for name, data in combos.items():
                     _mark = " ★ aktif" if (_ap == "combo" and _am == name) else ""
                     table.add_row(f"{name}{_mark}", data["strategy"], ", ".join(data["models"]))
                 console.print()
                 console.print(table)
+                console.print("[dim]Cara pakai: ketik untuk mencari · tombol atas bawah untuk pindah · Enter untuk pilih · Esc untuk batal · contoh: /combo use andalan[/dim]")
                 console.print()
             else:
-                print("\nCombos:")
+                print(f"\nGabungan — {_st0} — {_lbl0} — {_pos0}:")
                 for name, data in combos.items():
                     _mark = " ★ aktif" if (_ap == "combo" and _am == name) else ""
                     print(f"  {name}{_mark} [{data['strategy']}]: {', '.join(data['models'])}")
-                print()
+                print("[dim]Contoh: /combo use andalan[/dim]\n")
 
         elif _cmd == "use":
             self._combo_use(_rest)
@@ -2946,17 +3250,17 @@ class CodeAICLI:
             if _name.lower().startswith("combo/"):
                 _name = _name.split("/", 1)[1].strip()
             if not _name:
-                _print("[yellow]Usage: /combo remove <nama>[/yellow]")
+                _print("[yellow]Cara pakai: /combo remove <nama>[/yellow] [dim]Contoh: /combo remove andalan[/dim]")
                 return
             try:
                 _existing = manager.get_combo(_name)
             except Exception:
                 _existing = None
             if not _existing:
-                _print(f"[red]Combo '{_name}' tidak ditemukan.[/red] [dim](lihat /combo list)[/dim]")
+                _print(f"[red]Gabungan '{_name}' tidak ditemukan.[/red] [dim](lihat /combo list, contoh: /combo list)[/dim]")
                 return
             try:
-                _conf = (Prompt.ask(f"Hapus combo '{_name}'?", choices=["y", "n"], default="n") if RICH_AVAILABLE else input(f"Hapus combo '{_name}'? [y/N]: "))
+                _conf = (Prompt.ask(f"Hapus gabungan '{_name}'? Contoh y", choices=["y", "n"], default="n") if RICH_AVAILABLE else input(f"Hapus gabungan '{_name}'? Contoh y [y/N]: "))
             except (EOFError, KeyboardInterrupt):
                 _print("[dim]Dibatalkan.[/dim]")
                 return
@@ -2966,45 +3270,45 @@ class CodeAICLI:
             try:
                 manager.delete_combo(_name)
             except Exception as _e:
-                _print(f"[red]Gagal hapus combo: {_e}[/red]")
+                _print(f"[red]Gagal hapus gabungan: {_e}[/red] [dim]Contoh: /combo list[/dim]")
                 return
-            _print(f"[bold green]✅ Combo '{_name}' dihapus.[/bold green]")
+            _print(f"[bold green]✅ Gabungan '{_name}' dihapus.[/bold green]")
             return
         elif not _cmd or _cmd == "create":
             connected = self._list_connected_fast()
             if not connected:
-                _print("[yellow]No connected providers. Run /provider first.[/yellow]")
+                _print("[yellow]○ Belum terhubung — belum ada model — Langkah 1: ketik /provider[/yellow] [dim]Contoh: /provider gemini[/dim]")
                 return
 
             # Alur: nama → strategi (12 semua) → multi-pilih model → simpan.
-            name = (Prompt.ask("Combo name (empty back)") if RICH_AVAILABLE else input("Name (empty back): ")).strip()
+            name = (Prompt.ask("Nama gabungan (kosong=kembali), contoh: andalan") if RICH_AVAILABLE else input("Nama gabungan (kosong=kembali), contoh: andalan: ")).strip()
             if not name or name.lower() in ("back", "q"):
-                _print("[dim]Cancelled.[/dim]")
+                _print("[dim]Dibatalkan.[/dim]")
                 return
 
             strategies = [s.value for s in ComboStrategy]
             # 12 strategi SEMUA tampil (viewport TUI 15) — Enter pilih, Esc batal.
-            _spick = self._tui_pick("Combo — strategi", strategies, show=lambda x: x, initial="")
+            _spick = self._tui_pick("Gabungan — strategi Cari: ketik kata kunci", strategies, show=lambda x: x, initial="")
             if _spick is None:
-                _print("[dim]Cancelled.[/dim]")
+                _print("[dim]Dibatalkan.[/dim]")
                 return
             strategy = strategies[_spick]
 
             # Multi-pilih model: Spasi toggle ✓, Enter selesai (min 1), Esc/q batal.
-            _mpicks = self._tui_pick_multi("Combo — models", connected, show=lambda m: m["id"], initial="")
+            _mpicks = self._tui_pick_multi("Gabungan — model Cari: ketik kata kunci", connected, show=lambda m: m["id"], initial="")
             if not _mpicks:
-                _print("[dim]Cancelled.[/dim]")
+                _print("[dim]Dibatalkan.[/dim]")
                 return
             models = [connected[i]["id"] for i in _mpicks]
 
             manager.create_combo(name, strategy, models)
-            _print(f"[bold green]✅ Combo '{name}' created.[/bold green] [dim]({strategy} · {len(models)} models · pakai via /model combo/{name})[/dim]")
+            _print(f"[bold green]✅ Gabungan '{name}' tersimpan.[/bold green] [dim]({strategy} · {len(models)} model · pakai via /model combo/{name}, contoh: /model combo/{name})[/dim]")
 
-            sw = Prompt.ask("Switch to this combo?", choices=["y", "n"], default="y") if RICH_AVAILABLE else input("Switch? [y/N]: ")
+            sw = Prompt.ask("Pindah ke gabungan ini? Contoh y", choices=["y", "n"], default="y") if RICH_AVAILABLE else input("Pindah ke gabungan ini? Contoh y [y/N]: ")
             if sw.strip().lower() == "y":
                 self.switch_model(f"combo/{name}")
         else:
-            _print("[yellow]Usage: /combo [list|create|use|edit|remove][/yellow] [dim]/combo use <nama> · /combo edit <nama> · /combo remove <nama> (type /help)[/dim]")
+            _print("[yellow]Cara pakai: /combo [list|create|use|edit|remove][/yellow] [dim]/combo use <nama> · /combo edit <nama> · /combo remove <nama> (ketik /bantuan, contoh: /combo list)[/dim]")
 
     def _combo_use(self, name_arg: str = "") -> None:
         """Aktifkan combo via jalur switch yang sudah ada (setara /model combo/<nama>)."""
@@ -3019,7 +3323,7 @@ class CodeAICLI:
             _name = _name.split("/", 1)[1].strip()
         if not _name:
             if not combos:
-                _print("[yellow]No combos saved.[/yellow] [dim](buat via /combo create)[/dim]")
+                _print("[yellow]Belum ada gabungan tersimpan.[/yellow] [dim](buat via /combo create, contoh: /combo create)[/dim]")
                 return
             items = sorted(combos.keys())
             def _show(n):
@@ -3028,7 +3332,7 @@ class CodeAICLI:
                     return f"{n} [{_d.get('strategy', '?')}] — {', '.join(_d.get('models', []) or [])}"
                 except Exception:
                     return str(n)
-            _pick = self._tui_pick("Combo — pakai", items, show=_show, initial="")
+            _pick = self._tui_pick("Gabungan — pakai Cari: ketik kata kunci", items, show=_show, initial="")
             if _pick is None:
                 _print("[dim]Dibatalkan.[/dim]")
                 return
@@ -3047,12 +3351,12 @@ class CodeAICLI:
             except Exception:
                 pass
         if not _def:
-            _print(f"[red]Combo '{_name}' tidak ditemukan.[/red] [dim](lihat /combo list)[/dim]")
+            _print(f"[red]Gabungan '{_name}' tidak ditemukan.[/red] [dim](lihat /combo list, contoh: /combo list)[/dim]")
             return
         try:
             self.switch_model(f"combo/{_name}")
         except Exception as _e:
-            _print(f"[red]Gagal pakai combo '{_name}': {_e}[/red]")
+            _print(f"[red]Gagal pakai gabungan '{_name}': {_e}[/red] [dim]Contoh: /combo list[/dim]")
 
     def _combo_edit(self, name_arg: str = "") -> None:
         """Ubah strategi + tambah/buang models, simpan overwrite (nama tetap)."""
@@ -3067,7 +3371,7 @@ class CodeAICLI:
             _name = _name.split("/", 1)[1].strip()
         if not _name:
             if not combos:
-                _print("[yellow]No combos saved.[/yellow] [dim](buat via /combo create)[/dim]")
+                _print("[yellow]Belum ada gabungan tersimpan.[/yellow] [dim](buat via /combo create, contoh: /combo create)[/dim]")
                 return
             items = sorted(combos.keys())
             def _show2(n):
@@ -3076,7 +3380,7 @@ class CodeAICLI:
                     return f"{n} [{_d.get('strategy', '?')}] — {', '.join(_d.get('models', []) or [])}"
                 except Exception:
                     return str(n)
-            _pick0 = self._tui_pick("Combo — edit", items, show=_show2, initial="")
+            _pick0 = self._tui_pick("Gabungan — ubah Cari: ketik kata kunci", items, show=_show2, initial="")
             if _pick0 is None:
                 _print("[dim]Dibatalkan.[/dim]")
                 return
@@ -3096,7 +3400,7 @@ class CodeAICLI:
             except Exception:
                 pass
         if not isinstance(_cur, dict):
-            _print(f"[red]Combo '{_name}' tidak ditemukan.[/red] [dim](lihat /combo list)[/dim]")
+            _print(f"[red]Gabungan '{_name}' tidak ditemukan.[/red] [dim](lihat /combo list, contoh: /combo list)[/dim]")
             return
         try:
             _cur_strategy = str(_cur.get("strategy", "") or "")
@@ -3116,36 +3420,36 @@ class CodeAICLI:
                 return f"{s} ★ saat ini" if s == _cur_strategy else s
             except Exception:
                 return s
-        _spick = self._tui_pick("Combo — strategi (baru)", strategies, show=_sshow, initial=_cur_strategy or "")
+        _spick = self._tui_pick("Gabungan — strategi baru Cari: ketik kata kunci", strategies, show=_sshow, initial=_cur_strategy or "")
         if _spick is None:
             _print("[dim]Dibatalkan.[/dim]")
             return
         new_strategy = strategies[_spick]
         connected = self._list_connected_fast()
         if not connected:
-            _print("[yellow]No connected providers. Run /provider first.[/yellow]")
+            _print("[yellow]○ Belum terhubung — belum ada model — Langkah 1: ketik /provider[/yellow] [dim]Contoh: /provider gemini[/dim]")
             return
         try:
             _cur_txt = ", ".join(_cur_models) if _cur_models else "—"
         except Exception:
             _cur_txt = "—"
-        _mpicks = self._tui_pick_multi(f"Combo — models (saat ini: {_cur_txt})", connected, show=lambda m: m["id"], initial="")
+        _mpicks = self._tui_pick_multi(f"Gabungan — model (saat ini: {_cur_txt}) Cari: ketik kata kunci", connected, show=lambda m: m["id"], initial="")
         if not _mpicks:
             _print("[dim]Dibatalkan.[/dim]")
             return
         new_models = [connected[i]["id"] for i in _mpicks]
         try:
-            manager.create_combo(_canon, new_strategy, new_models, params=_cur_params)
+            manager.create_combo(_canon, new_strategy, new_models, params=_cur_params, overwrite=True)
         except TypeError:
             try:
                 manager.create_combo(_canon, new_strategy, new_models)
             except Exception as _e:
-                _print(f"[red]Gagal simpan combo: {_e}[/red]")
+                _print(f"[red]Gagal simpan gabungan: {_e}[/red] [dim]Contoh: /combo list[/dim]")
                 return
         except Exception as _e:
-            _print(f"[red]Gagal simpan combo: {_e}[/red]")
+            _print(f"[red]Gagal simpan gabungan: {_e}[/red] [dim]Contoh: /combo list[/dim]")
             return
-        _print(f"[bold green]✅ Combo '{_canon}' diperbarui.[/bold green] [dim]({new_strategy} · {len(new_models)} models · pakai via /combo use {_canon})[/dim]")
+        _print(f"[bold green]✅ Gabungan '{_canon}' diperbarui.[/bold green] [dim]({new_strategy} · {len(new_models)} model · pakai via /combo use {_canon}, contoh: /combo use {_canon})[/dim]")
 
     @staticmethod
     def _combo_extract_serving(result):
@@ -3252,7 +3556,7 @@ class CodeAICLI:
         except Exception:
             _sp, _sm = None, None
         if _sp and _sm:
-            _print(f"[dim]dilayani oleh combo {_cn} → {_sp}/{_sm} member aktual[/dim]")
+            _print(f"[dim]Dijawab oleh gabungan {_cn} memakai {_sp}/{_sm}[/dim]")
             return
         try:
             from harness.models.combo import ComboManager as _CM2
@@ -3269,9 +3573,9 @@ class CodeAICLI:
             except Exception:
                 _mems = []
             _mem_txt = ", ".join(_mems) if _mems else "—"
-            _print(f"[dim]dilayani oleh combo {_cn} [{_strat}] · member: {_mem_txt} (serving member tak diekspos provider)[/dim]")
+            _print(f"[dim]Dijawab oleh gabungan {_cn} memakai {_mem_txt} [{_strat}][/dim]")
         else:
-            _print(f"[dim]dilayani oleh combo {_cn} (detail combo tak ditemukan)[/dim]")
+            _print(f"[dim]Dijawab oleh gabungan {_cn} memakai — (detail tidak ditemukan)[/dim]")
         try:
             logging.getLogger(__name__).warning("Handoff next-wave: ComboProvider tak mengekspos serving member (butuh serving_provider/serving_model di return dict) — lihat harness/models/combo.py:ComboProvider.chat")
         except Exception:
@@ -3283,47 +3587,54 @@ class CodeAICLI:
 
     def show_history(self):
         if not self.orchestrator:
-            _print("[yellow]Orchestrator not initialised.[/yellow]")
+            _print("[yellow]Orchestrator belum siap.[/yellow] [dim]Contoh: ketik halo untuk mulai[/dim]")
             return
 
         ctx = self.orchestrator.compactor.get_context()
         fact_cards = ctx.get("fact_cards", [])
         history    = ctx.get("active_history", [])
 
+        try:
+            _st0, _lbl0, _pos0 = self._status_baku()
+        except Exception:
+            _st0, _lbl0, _pos0 = ("○ Belum terhubung", "belum ada model", "Langkah 1: ketik /provider")
         if not fact_cards and not history:
-            _print("[dim]No conversation history yet.[/dim]")
+            _print(f"[dim]{_st0} — {_lbl0} — {_pos0}[/dim]")
+            _print("[dim]Belum ada riwayat percakapan.[/dim] [dim]Contoh: ketik halo untuk mulai[/dim]")
             return
 
         if RICH_AVAILABLE:
+            console.print(f"[dim]{_st0} — {_lbl0} — {_pos0}[/dim]")
             console.print()
             if fact_cards:
-                _rule("Compressed Context (Fact Cards)", style="dim")
+                _rule("Konteks Ringkas (Kartu Fakta)", style="dim")
                 for fc in fact_cards:
                     console.print(f"  [dim]{fc}[/dim]")
                 console.print()
 
             if history:
-                _rule("Active History", style="dim")
+                _rule("Riwayat Aktif", style="dim")
                 for msg in history:
-                    role  = msg.get("role", "unknown")
+                    role  = msg.get("role", "tidak dikenal")
                     body  = msg.get("content", "")
                     color = "cyan" if role == "user" else "green"
-                    label = "You ❯" if role == "user" else "AI ◆"
+                    label = "Anda ❯" if role == "user" else "AI ◆"
                     console.print(f"[bold {color}]{label}[/bold {color}]")
                     # Truncate very long entries for readability
                     if len(body) > 500:
-                        body = body[:500] + "… [dim](truncated)[/dim]"
+                        body = body[:500] + "… [dim](dipotong)[/dim]"
                     console.print(f"  {body}")
                     console.print()
         else:
+            print(f"\n{_st0} — {_lbl0} — {_pos0}")
             if fact_cards:
-                print("\n── Fact Cards ──")
+                print("\n── Kartu Fakta ──")
                 for fc in fact_cards:
                     print(f"  {fc}")
             if history:
-                print("\n── History ──")
+                print("\n── Riwayat ──")
                 for msg in history:
-                    print(f"[{'You ❯' if msg.get('role') == 'user' else 'AI ◆'}]: {msg.get('content','')[:300]}")
+                    print(f"[{'Anda ❯' if msg.get('role') == 'user' else 'AI ◆'}]: {msg.get('content','')[:300]}")
             print()
 
     # ------------------------------------------------------------------
@@ -3335,40 +3646,65 @@ class CodeAICLI:
         agents_exists = os.path.exists("AGENTS.md")
         hooks_exists  = os.path.exists("SYSTEM_HOOKS.md")
         state = self.orchestrator.workflow_state if self.orchestrator else "N/A"
+        try:
+            _st, _lbl, _pos = self._status_baku()
+        except Exception:
+            _st, _lbl, _pos = ("○ Belum terhubung", "belum ada model", "Langkah 1: ketik /provider")
+        try:
+            _eff_raw = getattr(getattr(self.config, "provider", None), "effort", None) or "—"
+            _eff = self._effort_id(_eff_raw) if _eff_raw != "—" else "—"
+        except Exception:
+            _eff = "—"
+        _keadaan = str(state or "—")
 
         if RICH_AVAILABLE:
+            console.print(f"[bold]{_st} — {_lbl} — {_pos}[/bold]")
             table = Table(show_header=False, box=None, padding=(0, 2))
-            table.add_row("[dim]Provider[/dim]",  f"[cyan]{provider}[/cyan]")
-            table.add_row("[dim]Model[/dim]",     f"[yellow]{model}[/yellow]")
-            table.add_row("[dim]State[/dim]",     state)
-            table.add_row("[dim]AGENTS.md[/dim]", "[green]loaded[/green]" if agents_exists else "[dim]not found[/dim]")
-            table.add_row("[dim]HOOKS[/dim]",     "[green]loaded[/green]" if hooks_exists  else "[dim]not found[/dim]")
+            table.add_row("[dim]Status[/dim]",  f"[green]{_st}[/green]")
+            table.add_row("[dim]Penyedia[/dim]",  f"[cyan]{provider}[/cyan]")
+            table.add_row("[dim]Model[/dim]",     f"[yellow]{model}[/yellow] [dim]({_lbl})[/dim]")
+            table.add_row("[dim]Posisi[/dim]",     f"{_pos}")
+            table.add_row("[dim]Kekuatan pikir[/dim]", f"{_eff} [dim](1 rendah · 2 sedang · 3 tinggi)[/dim]")
+            table.add_row("[dim]Keadaan[/dim]",     f"{_keadaan}")
+            table.add_row("[dim]AGENTS.md[/dim]", "[green]ada[/green]" if agents_exists else "[dim]tidak ada[/dim]")
+            table.add_row("[dim]HOOKS[/dim]",     "[green]ada[/green]" if hooks_exists  else "[dim]tidak ada[/dim]")
             console.print()
             console.print(table)
+            console.print("[dim]Contoh: /model gemini · /provider gemini · ketik /bantuan[/dim]")
             console.print()
         else:
-            print(f"\nProvider: {provider}\nModel: {model}\nState: {state}")
-            print(f"AGENTS.md: {'yes' if agents_exists else 'no'}")
-            print(f"HOOKS: {'yes' if hooks_exists else 'no'}\n")
+            print(f"\n{_st} — {_lbl} — {_pos}")
+            print(f"Status: {_st}\nPenyedia: {provider}\nModel: {model} ({_lbl})\nPosisi: {_pos}\nKekuatan pikir: {_eff} (1 rendah · 2 sedang · 3 tinggi)\nKeadaan: {_keadaan}")
+            print(f"AGENTS.md: {'ada' if agents_exists else 'tidak ada'}")
+            print(f"HOOKS: {'ada' if hooks_exists else 'tidak ada'}")
+            print("Contoh: /model gemini · /provider gemini · ketik /bantuan\n")
 
     def show_config(self):
+        try:
+            _st0, _lbl0, _pos0 = self._status_baku()
+        except Exception:
+            _st0, _lbl0, _pos0 = ("○ Belum terhubung", "belum ada model", "Langkah 1: ketik /provider")
         if RICH_AVAILABLE:
             import json
             from pydantic import BaseModel
             data = self.config.model_dump() if hasattr(self.config, "model_dump") else self.config.__dict__
+            console.print(f"[dim]{_st0} — {_lbl0} — {_pos0}[/dim]")
             console.print()
             console.print_json(json.dumps(data, default=str))
+            console.print("[dim]Contoh: /pengaturan untuk lihat, /keadaan untuk ringkas[/dim]")
             console.print()
         else:
+            print(f"{_st0} — {_lbl0} — {_pos0}")
             print(self.config.__dict__)
+            print("Contoh: /pengaturan untuk lihat, /keadaan untuk ringkas")
 
     def steer_orchestrator(self, instruction: str):
         instruction = (instruction or "").strip()
         if not instruction:
-            _print("[yellow]Usage: /steer <instruction>[/yellow]")
+            _print("[yellow]Cara pakai: /steer (/alih) <perintah>[/yellow] [dim]Contoh: /steer lanjutkan · /alih lanjutkan[/dim]")
             return
         if not self.orchestrator:
-            _print("[yellow]Tidak ada tugas berjalan[/yellow] [dim](jalankan tugas dulu, lalu /steer)[/dim]")
+            _print("[yellow]Tidak ada tugas berjalan[/yellow] [dim](jalankan tugas dulu, lalu /steer atau /alih, contoh: /alih lanjutkan)[/dim]")
             return
         # Steer jujur: hanya RUNNING boleh ✓; selain itu tolak tanpa ✓ palsu.
         try:
@@ -3377,15 +3713,29 @@ class CodeAICLI:
         except Exception:
             _state, _active = None, None
         if _state != "RUNNING" or not _active:
-            _print("[yellow]Tidak ada tugas berjalan[/yellow] [dim](jalankan tugas dulu, lalu /steer)[/dim]")
+            _print("[yellow]Tidak ada tugas berjalan[/yellow] [dim](jalankan tugas dulu, lalu /steer atau /alih, contoh: /alih lanjutkan)[/dim]")
             return
-        _print(f"[blue]◉ steering → {instruction}[/blue]")
+        _print(f"[blue]◉ mengarahkan → {instruction}[/blue]")
         try:
             async def _do():
                 try:
-                    await self.orchestrator.steer_active_subagent(instruction)
+                    _r = await self.orchestrator.steer_active_subagent(instruction)
+                    if _r is False:
+                        try:
+                            _r2 = await self.orchestrator.process_user_input(instruction)
+                        except Exception:
+                            _r2 = False
+                        if isinstance(_r2, bool):
+                            return _r2
+                        return True
+                    if isinstance(_r, bool):
+                        return _r
+                    return True
                 except Exception:
-                    await self.orchestrator.process_user_input(instruction)
+                    _r3 = await self.orchestrator.process_user_input(instruction)
+                    if isinstance(_r3, bool):
+                        return _r3
+                    return True
             try:
                 loop = asyncio.get_event_loop()
             except RuntimeError:
@@ -3393,41 +3743,58 @@ class CodeAICLI:
             if loop is not None and loop.is_running():
                 import concurrent.futures
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    pool.submit(asyncio.run, _do()).result()
+                    _steered = pool.submit(asyncio.run, _do()).result(timeout=30)
             else:
-                asyncio.run(_do())
-            _print("[green]✓ steered[/green]")
+                try:
+                    _steered = asyncio.run(asyncio.wait_for(_do(), timeout=30))
+                except AttributeError:
+                    _steered = asyncio.run(_do())
+            try:
+                _ok_flag = bool(_steered) if isinstance(_steered, bool) else True
+            except Exception:
+                _ok_flag = True
+            if not _ok_flag:
+                _print("[yellow]Tidak ada tugas berjalan[/yellow] [dim](jalankan tugas dulu, lalu /steer atau /alih, contoh: /alih lanjutkan)[/dim]")
+                return
+            _print("[green]✓ sudah dialihkan[/green]")
         except ValueError as e:
-            _print(f"[yellow]Nothing to steer: {e}[/yellow] [dim](run a task first)[/dim]")
+            _print(f"[yellow]Tidak ada tugas berjalan: {e}[/yellow] [dim](jalankan tugas dulu, contoh: halo)[/dim]")
         except Exception as e:
-            _print(f"[red]Steer failed: {e}[/red] [dim](type /help)[/dim]")
+            _print(f"[red]Gagal alih: {e}[/red] [dim](ketik /bantuan)[/dim]")
 
     def show_help(self):
+        try:
+            _st0, _lbl0, _pos0 = self._status_baku()
+        except Exception:
+            _st0, _lbl0, _pos0 = ("○ Belum terhubung", "belum ada model", "Langkah 1: ketik /provider")
         groups = [
-            ("Model", [("/model (/m)", "Switch — fuzzy query direct or selector; base-effort inline"),
-                       ("/effort (/e)", "Show/set Antigravity effort (persisted)"),
-                       ("/combo (/c)", "Manage combos [list|create|use|edit|remove]")]),
-            ("Auth", [("/provider [id]", "Authenticate/switch provider"),
-                      ("/providers (/p)", "List providers + status"),
-                      ("/provider add|list|remove", "Manage custom providers"),
-                      ("/models <prov>", "List models for provider")]),
-            ("Session", [("/steer (/st)", "Steer active subagent"),
-                         ("/history", "Show history + fact cards"),
-                         ("/status (/s)", "Provider, model, state"),
-                         ("/config", "Show runtime config (JSON)")]),
-            ("Help", [("/help (/h)", "This help"), ("/quit (/q)", "Exit")]),
+            ("MODEL", [("/model (/m)", "Pindah model — ketik kata kunci atau pilih; contoh: /model gemini"),
+                       ("/effort (/e)", "Lihat/atur kekuatan pikir — 1 rendah · 2 sedang · 3 tinggi; contoh: /effort 2"),
+                       ("/combo (/c)", "Kelola gabungan [list|create|use|edit|remove]; contoh: /combo list"),
+                       ("/models <penyedia>", "Daftar model penyedia; contoh: /models gemini")]),
+            ("SAMBUNGAN", [("/provider [id]", "Masuk/pindah penyedia; contoh: /provider gemini"),
+                      ("/providers (/p) (/daftar)", "Daftar penyedia + status Terhubung; contoh: /daftar"),
+                      ("/provider add|list|remove", "Kelola penyedia kustom; contoh: /provider list"),
+                      ("/daftar", "Sama dengan /providers — daftar penyedia")]),
+            ("SESI", [("/steer (/st) (/alih)", "Alihkan tugas berjalan; contoh: /alih lanjutkan"),
+                         ("/history (/riwayat)", "Lihat riwayat + kartu fakta; contoh: /riwayat"),
+                         ("/status (/s) (/keadaan)", "Lihat penyedia, model, status, posisi; contoh: /keadaan"),
+                         ("/config (/pengaturan)", "Lihat pengaturan berjalan; contoh: /pengaturan")]),
+            ("BANTUAN", [("/help (/h) (/bantuan)", "Bantuan ini; contoh: /bantuan"), ("/quit (/q) (/keluar)", "Keluar; contoh: /keluar")]),
         ]
         if RICH_AVAILABLE:
+            console.print(f"[dim]{_st0} — {_lbl0} — {_pos0}[/dim]")
             for g, rows in groups:
                 console.print(f"[bold blue]{g}[/bold blue]")
                 table = Table(show_header=False, box=None, padding=(0, 2))
                 for cmd, desc in rows:
                     table.add_row(f"[cyan]{cmd}[/cyan]", f"[dim]{desc}[/dim]")
                 console.print(table)
-            console.print("[dim]Tip: Ctrl-C interrupts, /steer redirects · prefix works; unknown → did-you-mean.[/dim]")
+            console.print("[dim]Cara pakai: Ctrl-C berhenti, /steer (/alih) mengarahkan · contoh: /model gemini · ketik /bantuan[/dim]")
         else:
+            print(f"\n{_st0} — {_lbl0} — {_pos0}")
             for g, rows in groups:
                 print(f"\n[{g}]")
                 for cmd, desc in rows:
-                    print(f"  {cmd:<18} {desc}")
-            print("\nTip: Ctrl-C interrupts, /steer redirects · prefix works; unknown → did-you-mean.")
+                    print(f"  {cmd:<30} {desc}")
+            print("\nCara pakai: Ctrl-C berhenti, /steer (/alih) mengarahkan · contoh: /model gemini · ketik /bantuan")

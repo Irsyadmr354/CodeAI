@@ -194,7 +194,20 @@ class LLMGateway:
         self._apply_lock = threading.RLock()
         self._cooldown_lock = threading.Lock()
         self._provider_cooldown: Dict[str, float] = {}
+        # F06: per-provider RLocks + short master guard. _apply_lock kept
+        # for API compat (short sections only, never held across chat I/O).
+        self._provider_locks: Dict[str, threading.RLock] = {}
+        self._provider_locks_guard = threading.Lock()
         self._initialize_providers()
+
+    def _lock_for_provider(self, name: str) -> threading.RLock:
+        """Return the per-provider RLock (created under short master guard)."""
+        with self._provider_locks_guard:
+            lock = self._provider_locks.get(name)
+            if lock is None:
+                lock = threading.RLock()
+                self._provider_locks[name] = lock
+            return lock
 
     # ------------------------------------------------------------------
     # Initialisation
@@ -245,48 +258,50 @@ class LLMGateway:
         Inject the selected model into the provider so it is used for this request.
         Normalises `base-effort` / `base:effort` suffixes: the API always
         receives the CLEAN base name; effort is stored on `provider.effort`.
-        Thread-safe via _apply_lock (caller should still snapshot/restore).
+        F06: caller holds the per-provider RLock for snapshot→apply→restore;
+        this helper takes NO lock itself (short mutation only, never I/O).
+        _apply_lock is kept for API compat only, never held across chat I/O.
         When _allow_global_effort is False (combo-member isolated calls),
         global config effort is NOT injected unless the member provider
         explicitly supports effort (Antigravity EFFORT_MODELS); guard never crashes.
         """
         from harness.models.providers.antigravity import AntigravityProvider, EFFORT_MODELS, DEFAULT_ANTIGRAVITY_EFFORT
-        with self._apply_lock:
-            _m = model.strip() if isinstance(model, str) else model
-            # Defensive: if a "provider/model" string leaks in here, use bare part.
-            if isinstance(_m, str) and "/" in _m:
-                _m = _m.split("/")[-1].strip() or _m.strip()
-            base, effort = _safe_parse_model_effort(_m)
-            if isinstance(base, str):
-                base = base.strip()
-            if isinstance(effort, str):
-                effort = effort.strip().lower() or None
-            cfg_effort = self._config_effort()
-            if not _allow_global_effort:
-                try:
-                    _supports = bool(
-                        isinstance(provider, AntigravityProvider)
-                        and isinstance(base, str)
-                        and base in EFFORT_MODELS
-                    )
-                except Exception:
-                    _supports = False
-                if not _supports:
-                    cfg_effort = None
-            if isinstance(provider, AntigravityProvider):
-                provider.model = base
-                provider.effort = effort or cfg_effort or (
-                    DEFAULT_ANTIGRAVITY_EFFORT if base in EFFORT_MODELS else ""
+        # F06 lock-free: caller holds per-provider RLock; no global lock here.
+        _m = model.strip() if isinstance(model, str) else model
+        # Defensive: if a "provider/model" string leaks in here, use bare part.
+        if isinstance(_m, str) and "/" in _m:
+            _m = _m.split("/")[-1].strip() or _m.strip()
+        base, effort = _safe_parse_model_effort(_m)
+        if isinstance(base, str):
+            base = base.strip()
+        if isinstance(effort, str):
+            effort = effort.strip().lower() or None
+        cfg_effort = self._config_effort()
+        if not _allow_global_effort:
+            try:
+                _supports = bool(
+                    isinstance(provider, AntigravityProvider)
+                    and isinstance(base, str)
+                    and base in EFFORT_MODELS
                 )
-            elif isinstance(provider, (OpenAIProvider, AnthropicProvider, OllamaProvider, GeminiProvider)):
-                provider.model = base
-                provider.effort = effort or cfg_effort or getattr(provider, "effort", None) or ""
-            elif isinstance(provider, CopilotProvider):
-                provider.model = base
-                provider.effort = effort or cfg_effort or getattr(provider, "effort", None) or ""
-            elif isinstance(provider, UniversalOpenAIProvider):
-                provider.default_model = base
-                provider.effort = effort or cfg_effort or getattr(provider, "effort", None) or ""
+            except Exception:
+                _supports = False
+            if not _supports:
+                cfg_effort = None
+        if isinstance(provider, AntigravityProvider):
+            provider.model = base
+            provider.effort = effort or cfg_effort or (
+                DEFAULT_ANTIGRAVITY_EFFORT if base in EFFORT_MODELS else ""
+            )
+        elif isinstance(provider, (OpenAIProvider, AnthropicProvider, OllamaProvider, GeminiProvider)):
+            provider.model = base
+            provider.effort = effort or cfg_effort or getattr(provider, "effort", None) or ""
+        elif isinstance(provider, CopilotProvider):
+            provider.model = base
+            provider.effort = effort or cfg_effort or getattr(provider, "effort", None) or ""
+        elif isinstance(provider, UniversalOpenAIProvider):
+            provider.default_model = base
+            provider.effort = effort or cfg_effort or getattr(provider, "effort", None) or ""
 
     def _snapshot_provider(self, provider: BaseProvider) -> Dict[str, Any]:
         snap: Dict[str, Any] = {}
@@ -379,51 +394,58 @@ class LLMGateway:
         if _name == "combo":
             raise ProviderError("Combo provider requires a combo name as model (e.g. combo/my_combo).")
 
-        with self._apply_lock:
+        # Fast path under short master guard (never held across I/O).
+        with self._provider_locks_guard:
             if _name in self._providers:
                 return self._providers[_name]
 
-            # Try to load dynamically via registry → UniversalOpenAIProvider
-            descriptor = self.registry.get_provider_descriptor(_name)
-            # Case-insensitive fallback for robustness ("Antigravity " etc.).
-            if descriptor is None and isinstance(_name, str) and _name.lower() != _name:
-                _low = _name.lower()
-                descriptor = self.registry.get_provider_descriptor(_low)
-                if descriptor is not None:
-                    _name = _low
-            if descriptor and descriptor.get("api"):
-                vault = AuthVault()
-                api_key = (
-                    os.environ.get(f"{_name.upper()}_API_KEY")
-                    or vault.get_token(_name)
+        # Try to load dynamically via registry → UniversalOpenAIProvider
+        descriptor = self.registry.get_provider_descriptor(_name)
+        # Case-insensitive fallback for robustness ("Antigravity " etc.).
+        if descriptor is None and isinstance(_name, str) and _name.lower() != _name:
+            _low = _name.lower()
+            descriptor = self.registry.get_provider_descriptor(_low)
+            if descriptor is not None:
+                _name = _low
+                with self._provider_locks_guard:
+                    if _name in self._providers:
+                        return self._providers[_name]
+        if descriptor and descriptor.get("api"):
+            vault = AuthVault()
+            api_key = (
+                os.environ.get(f"{_name.upper()}_API_KEY")
+                or vault.get_token(_name)
+            )
+            # Try provider-specific discover method if available
+            if not api_key:
+                discover = getattr(vault, f"discover_{_name}_token", None)
+                if callable(discover):
+                    api_key = discover()
+
+            base_url = descriptor["api"]
+            is_local = "127.0.0.1" in base_url or "localhost" in base_url
+
+            if not api_key and not is_local:
+                raise ProviderError(
+                    f"Credentials not found for provider '{_name}'. "
+                     f"Run '/provider {_name}' to authenticate."
                 )
-                # Try provider-specific discover method if available
-                if not api_key:
-                    discover = getattr(vault, f"discover_{_name}_token", None)
-                    if callable(discover):
-                        api_key = discover()
 
-                base_url = descriptor["api"]
-                is_local = "127.0.0.1" in base_url or "localhost" in base_url
-
-                if not api_key and not is_local:
-                    raise ProviderError(
-                        f"Credentials not found for provider '{_name}'. "
-                         f"Run '/provider {_name}' to authenticate."
-                    )
-
-                provider = UniversalOpenAIProvider(
-                    base_url=base_url,
-                    api_key=api_key or "",
-                    default_model=getattr(self.config, f"{_name}_model", ""),
-                )
+            provider = UniversalOpenAIProvider(
+                base_url=base_url,
+                api_key=api_key or "",
+                default_model=getattr(self.config, f"{_name}_model", ""),
+            )
+            with self._provider_locks_guard:
+                if _name in self._providers:
+                    return self._providers[_name]
                 self._providers[_name] = provider
                 return provider
 
-            raise ProviderError(
-                f"Provider '{_name}' is not configured or unsupported. "
-                "Run '/providers' to see available options."
-            )
+        raise ProviderError(
+            f"Provider '{_name}' is not configured or unsupported. "
+            "Run '/providers' to see available options."
+        )
 
     # ------------------------------------------------------------------
     # Chat
@@ -618,32 +640,38 @@ class LLMGateway:
         ordered: List[Any] = []
 
         for provider_name in providers_to_try:
-            # Critical section is per-provider attempt and covers
-            # cooldown-check → snapshot → apply → chat → restore → cooldown-mark
-            # atomically, so parallel fastest/consensus calls sharing one
-            # gateway cannot interleave model/effort mutation. RLock keeps
-            # nested get_provider/_apply_active_model safe.
+            # F06: per-provider RLock for short mutation only (never across I/O).
+            # Cooldown check+mark are atomic via _cooldown_lock (short).
+            # snapshot+apply under provider lock, chat OUTSIDE lock,
+            # restore under provider lock in finally. Different providers
+            # run concurrently; same provider serialises mutation only.
+            # Failover semantics, anti-pollution, hints unchanged.
             _pn = provider_name.strip() if isinstance(provider_name, str) else provider_name
             is_target = (_pn == target_provider_name)
-            with self._apply_lock:
-                if self._in_cooldown(_pn) and not (explicit_target and is_target):
-                    logger.debug(
-                        f"Skipping provider '{_pn}' (cooldown after recent failure)."
-                    )
-                    continue
-                # Failover only across CONNECTED providers: skip a clearly
-                # unconnected local failover candidate (e.g. ollama with no
-                # listener) without forcing an attempt. Target is never
-                # pre-skipped so its original cause stays visible.
-                _skip_reason = self._unavailable_skip_reason(_pn, is_target)
-                if _skip_reason:
-                    logger.debug(
-                        f"Skipping provider '{_pn}' (unavailable: {_skip_reason})."
-                    )
-                    attempts.append(f"{_pn}: skipped ({_skip_reason})")
-                    continue
-                snap: Dict[str, Any] = {}
-                try:
+            # Atomic cooldown check (short _cooldown_lock only, no long lock).
+            if self._in_cooldown(_pn) and not (explicit_target and is_target):
+                logger.debug(
+                    f"Skipping provider '{_pn}' (cooldown after recent failure)."
+                )
+                continue
+            # Failover only across CONNECTED providers: skip a clearly
+            # unconnected local failover candidate (e.g. ollama with no
+            # listener) without forcing an attempt. Target is never
+            # pre-skipped so its original cause stays visible.
+            _skip_reason = self._unavailable_skip_reason(_pn, is_target)
+            if _skip_reason:
+                logger.debug(
+                    f"Skipping provider '{_pn}' (unavailable: {_skip_reason})."
+                )
+                attempts.append(f"{_pn}: skipped ({_skip_reason})")
+                continue
+            _plock = self._lock_for_provider(_pn)
+            provider = None
+            snap: Dict[str, Any] = {}
+            effective_tools = tools
+            # Phase 1: resolve + snapshot + apply under provider lock (no I/O).
+            try:
+                with _plock:
                     provider = self.get_provider(_pn)
                     snap = self._snapshot_provider(provider)
 
@@ -671,86 +699,182 @@ class LLMGateway:
                     logger.debug(
                         f"Calling provider '{_pn}' with model '{target_model_name or '<default>'}'"
                     )
-                    try:
-                        return provider.chat(messages, effective_tools)
-                    finally:
+            except (RateLimitError, TimeoutError) as e:
+                if provider is not None:
+                    with _plock:
                         try:
                             self._restore_provider(provider, snap)
                         except Exception:
                             pass
-
-                except (RateLimitError, TimeoutError) as e:
+                logger.debug(
+                    f"Provider '{_pn}' hit transient error ({type(e).__name__}): {e}. "
+                    "Trying next failover..."
+                )
+                self._mark_cooldown(_pn)
+                ordered.append((_pn, e))
+                if _is_unavailable_error(e):
+                    attempts.append(f"{_pn}: skipped ({e})")
+                else:
+                    attempts.append(f"{_pn}: {e}")
+                if is_target and target_error is None:
+                    target_error = e
+                last_error = e
+                continue
+            except ProviderError as e:
+                if provider is not None:
+                    with _plock:
+                        try:
+                            self._restore_provider(provider, snap)
+                        except Exception:
+                            pass
+                ordered.append((_pn, e))
+                if _is_unavailable_error(e):
+                    logger.debug(f"Provider '{_pn}' unavailable, skipping: {e}")
+                    attempts.append(f"{_pn}: skipped ({e})")
+                    if is_target and target_error is None:
+                        target_error = e
+                    last_error = e
+                    continue
+                if is_target and target_error is None:
+                    target_error = e
+                last_error = e
+                if _is_timeout_error(e):
                     logger.debug(
-                        f"Provider '{_pn}' hit transient error ({type(e).__name__}): {e}. "
+                        f"Provider '{_pn}' timeout via ProviderError: {e}. "
                         "Trying next failover..."
                     )
                     self._mark_cooldown(_pn)
-                    ordered.append((_pn, e))
-                    if _is_unavailable_error(e):
-                        attempts.append(f"{_pn}: skipped ({e})")
-                    else:
-                        attempts.append(f"{_pn}: {e}")
+                    continue
+                if explicit_target and is_target and _is_auth_error(e):
+                    raise ProviderError(
+                        f"Provider '{target_provider_name}' failed for model "
+                        f"'{target_model_name or '<default>'}': {e} "
+                         f"Run '/provider {target_provider_name}' or '/model' to switch."
+                    ) from e
+                logger.debug(f"Provider '{_pn}' non-recoverable error: {e}")
+                attempts.append(f"{_pn}: {e}")
+                continue
+            except Exception as e:
+                if provider is not None:
+                    with _plock:
+                        try:
+                            self._restore_provider(provider, snap)
+                        except Exception:
+                            pass
+                ordered.append((_pn, e))
+                if _is_unavailable_error(e):
+                    logger.debug(f"Provider '{_pn}' unavailable, skipping: {e}")
+                    attempts.append(f"{_pn}: skipped ({e})")
                     if is_target and target_error is None:
                         target_error = e
                     last_error = e
                     continue
-                except ProviderError as e:
-                    ordered.append((_pn, e))
-                    if _is_unavailable_error(e):
-                        logger.debug(f"Provider '{_pn}' unavailable, skipping: {e}")
-                        attempts.append(f"{_pn}: skipped ({e})")
-                        if is_target and target_error is None:
-                            target_error = e
-                        last_error = e
-                        continue
-                    if is_target and target_error is None:
-                        target_error = e
-                    last_error = e
-                    if _is_timeout_error(e):
-                        logger.debug(
-                            f"Provider '{_pn}' timeout via ProviderError: {e}. "
-                            "Trying next failover..."
-                        )
-                        self._mark_cooldown(_pn)
-                        continue
-                    if explicit_target and is_target and _is_auth_error(e):
-                        raise ProviderError(
-                            f"Provider '{target_provider_name}' failed for model "
-                            f"'{target_model_name or '<default>'}': {e} "
-                             f"Run '/provider {target_provider_name}' or '/model' to switch."
-                        ) from e
-                    logger.debug(f"Provider '{_pn}' non-recoverable error: {e}")
+                if is_target and target_error is None:
+                    target_error = e
+                last_error = e
+                if _is_timeout_error(e):
+                    logger.debug(
+                        f"Provider '{_pn}' hit stdlib timeout "
+                        f"({type(e).__name__}): {e}. Trying next failover..."
+                    )
+                    self._mark_cooldown(_pn)
                     attempts.append(f"{_pn}: {e}")
                     continue
-                except Exception as e:
-                    ordered.append((_pn, e))
-                    if _is_unavailable_error(e):
-                        logger.debug(f"Provider '{_pn}' unavailable, skipping: {e}")
-                        attempts.append(f"{_pn}: skipped ({e})")
-                        if is_target and target_error is None:
-                            target_error = e
-                        last_error = e
-                        continue
+                if explicit_target and is_target and _is_auth_error(e):
+                    raise ProviderError(
+                        f"Provider '{target_provider_name}' failed for model "
+                        f"'{target_model_name or '<default>'}': {e} "
+                         f"Run '/provider {target_provider_name}' or '/model' to switch."
+                    ) from e
+                logger.debug(f"Provider '{_pn}' unexpected error: {e}")
+                attempts.append(f"{_pn}: {e}")
+                continue
+
+            # Phase 2: network I/O OUTSIDE any lock; restore under lock in finally.
+            try:
+                _result = provider.chat(messages, effective_tools)  # type: ignore[union-attr]
+            except (RateLimitError, TimeoutError) as e:
+                logger.debug(
+                    f"Provider '{_pn}' hit transient error ({type(e).__name__}): {e}. "
+                    "Trying next failover..."
+                )
+                self._mark_cooldown(_pn)
+                ordered.append((_pn, e))
+                if _is_unavailable_error(e):
+                    attempts.append(f"{_pn}: skipped ({e})")
+                else:
+                    attempts.append(f"{_pn}: {e}")
+                if is_target and target_error is None:
+                    target_error = e
+                last_error = e
+                continue
+            except ProviderError as e:
+                ordered.append((_pn, e))
+                if _is_unavailable_error(e):
+                    logger.debug(f"Provider '{_pn}' unavailable, skipping: {e}")
+                    attempts.append(f"{_pn}: skipped ({e})")
                     if is_target and target_error is None:
                         target_error = e
                     last_error = e
-                    if _is_timeout_error(e):
-                        logger.debug(
-                            f"Provider '{_pn}' hit stdlib timeout "
-                            f"({type(e).__name__}): {e}. Trying next failover..."
-                        )
-                        self._mark_cooldown(_pn)
-                        attempts.append(f"{_pn}: {e}")
-                        continue
-                    if explicit_target and is_target and _is_auth_error(e):
-                        raise ProviderError(
-                            f"Provider '{target_provider_name}' failed for model "
-                            f"'{target_model_name or '<default>'}': {e} "
-                             f"Run '/provider {target_provider_name}' or '/model' to switch."
-                        ) from e
-                    logger.debug(f"Provider '{_pn}' unexpected error: {e}")
+                    continue
+                if is_target and target_error is None:
+                    target_error = e
+                last_error = e
+                if _is_timeout_error(e):
+                    logger.debug(
+                        f"Provider '{_pn}' timeout via ProviderError: {e}. "
+                        "Trying next failover..."
+                    )
+                    self._mark_cooldown(_pn)
+                    continue
+                if explicit_target and is_target and _is_auth_error(e):
+                    raise ProviderError(
+                        f"Provider '{target_provider_name}' failed for model "
+                        f"'{target_model_name or '<default>'}': {e} "
+                         f"Run '/provider {target_provider_name}' or '/model' to switch."
+                    ) from e
+                logger.debug(f"Provider '{_pn}' non-recoverable error: {e}")
+                attempts.append(f"{_pn}: {e}")
+                continue
+            except Exception as e:
+                ordered.append((_pn, e))
+                if _is_unavailable_error(e):
+                    logger.debug(f"Provider '{_pn}' unavailable, skipping: {e}")
+                    attempts.append(f"{_pn}: skipped ({e})")
+                    if is_target and target_error is None:
+                        target_error = e
+                    last_error = e
+                    continue
+                if is_target and target_error is None:
+                    target_error = e
+                last_error = e
+                if _is_timeout_error(e):
+                    logger.debug(
+                        f"Provider '{_pn}' hit stdlib timeout "
+                        f"({type(e).__name__}): {e}. Trying next failover..."
+                    )
+                    self._mark_cooldown(_pn)
                     attempts.append(f"{_pn}: {e}")
                     continue
+                if explicit_target and is_target and _is_auth_error(e):
+                    raise ProviderError(
+                        f"Provider '{target_provider_name}' failed for model "
+                        f"'{target_model_name or '<default>'}': {e} "
+                         f"Run '/provider {target_provider_name}' or '/model' to switch."
+                    ) from e
+                logger.debug(f"Provider '{_pn}' unexpected error: {e}")
+                attempts.append(f"{_pn}: {e}")
+                continue
+            else:
+                return _result
+            finally:
+                # Anti-pollution restore under provider lock (short, no I/O).
+                with _plock:
+                    try:
+                        if provider is not None:
+                            self._restore_provider(provider, snap)
+                    except Exception:
+                        pass
 
         if _combo_isolated:
             _usable: Optional[Exception] = None

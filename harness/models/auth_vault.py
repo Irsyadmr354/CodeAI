@@ -13,12 +13,24 @@ import json
 import logging
 import os
 import subprocess
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Iterator, Optional
+
+try:  # POSIX file locking
+    import fcntl  # type: ignore[import-not-found]
+except Exception:
+    fcntl = None  # type: ignore[assignment]
+
+try:  # Windows file locking fallback
+    import msvcrt  # type: ignore[import-not-found]
+except Exception:
+    msvcrt = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +41,93 @@ GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 
 # OAuth refresh skew: refresh 60s before stated expiry
 _REFRESH_SKEW_MS = 60_000
+
+
+@contextmanager
+def _vault_lock(lock_path: Path) -> Iterator[Any]:
+    """Exclusive inter-process lock (flock; best-effort fallback).
+
+    Uses fcntl.flock on POSIX, msvcrt.locking on Windows, and degrades to
+    a no-op yield when neither is available. Never raises; never logs secrets.
+    """
+    fh: Any = None
+    try:
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        try:
+            fh = open(lock_path, "a+")
+        except OSError:
+            yield None
+            return
+        if fcntl is not None:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            except OSError:
+                pass
+        elif msvcrt is not None:
+            try:
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+            except OSError:
+                pass
+        # else: no locking primitive available → non-blocking skip (no-op)
+        yield fh
+    finally:
+        try:
+            if fh is not None:
+                if fcntl is not None:
+                    try:
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                elif msvcrt is not None:
+                    try:
+                        fh.seek(0)
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        pass
+        finally:
+            try:
+                if fh is not None:
+                    fh.close()
+            except Exception:
+                pass
+
+
+def _atomic_write_json(target: Path, payload: Dict[str, Any]) -> None:
+    """Atomically write JSON: tmp in same dir + chmod 600 + os.replace.
+
+    Raises OSError on failure (caller decides to swallow/log). Tmp file is
+    created with mkstemp in the target directory so replace() stays on the
+    same filesystem. Permissions are set to 0o600 BEFORE replace so the
+    window with lax perms is eliminated; re-applied after replace
+    best-effort (replace preserves tmp mode on POSIX).
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(target.parent), prefix=target.name + ".", suffix=".tmp"
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(payload, f, indent=4)
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp_path, target)
+        try:
+            os.chmod(target, 0o600)
+        except OSError:
+            pass
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _now_ms() -> int:
@@ -54,12 +153,13 @@ class AuthVault:
         try:
             with open(self.auth_file, "r") as f:
                 raw = json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
+        except (json.JSONDecodeError, OSError, ValueError) as e:
             logger.warning(
                 "AuthVault: unreadable/corrupt auth file %s (%s); starting empty",
                 self.auth_file,
                 type(e).__name__,
             )
+            self._data = {}
             return
 
         if not isinstance(raw, dict):
@@ -68,6 +168,7 @@ class AuthVault:
                 self.auth_file,
                 type(raw).__name__,
             )
+            self._data = {}
             return
 
         cleaned: Dict[str, Any] = {}
@@ -82,14 +183,77 @@ class AuthVault:
             self._save()
 
     def _save(self) -> None:
+        """Atomic persist: tmp in same dir + chmod 600 before os.replace."""
         try:
-            with open(self.auth_file, "w") as f:
-                json.dump(self._data, f, indent=4)
-            try:
-                os.chmod(self.auth_file, 0o600)
-            except OSError:
-                pass
+            _atomic_write_json(self.auth_file, dict(self._data))
         except OSError:
+            pass
+
+    def _lock_path(self) -> Path:
+        return self.auth_file.parent / (self.auth_file.name + ".lock")
+
+    def _read_disk_unlocked(self) -> Dict[str, Any]:
+        """Best-effort read of on-disk vault; corrupt → {} + warning, never raise."""
+        try:
+            if not self.auth_file.exists():
+                return {}
+            with open(self.auth_file, "r") as f:
+                raw = json.load(f)
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            logger.warning(
+                "AuthVault: unreadable/corrupt auth file %s (%s); starting empty",
+                self.auth_file,
+                type(e).__name__,
+            )
+            return {}
+        if not isinstance(raw, dict):
+            logger.warning(
+                "AuthVault: corrupt auth file %s (expected object, got %s); starting empty",
+                self.auth_file,
+                type(raw).__name__,
+            )
+            return {}
+        cleaned: Dict[str, Any] = {}
+        for k, v in raw.items():
+            clean_key = k.replace("/login ", "", 1) if k.startswith("/login ") else k
+            cleaned[clean_key] = v
+        return cleaned
+
+    def _locked_save(self, mutator: Callable[[Dict[str, Any]], None]) -> None:
+        """Serialise load-modify-save under an inter-process file lock.
+
+        Re-reads disk inside the lock (avoid lost-update), applies mutator
+        to self._data, then atomically persists. Refresh/store/remove paths
+        must route through here. Never raises on lock/IO failure; never
+        logs secrets.
+        """
+        try:
+            with _vault_lock(self._lock_path()):
+                try:
+                    fresh = self._read_disk_unlocked()
+                except Exception:
+                    fresh = {}
+                # Rebase in-memory view on fresh disk state so concurrent
+                # writers do not clobber each other (lost-update guard).
+                # In-memory keys not yet persisted are preserved when the
+                # disk has no conflicting entry.
+                try:
+                    merged: Dict[str, Any] = dict(fresh)
+                    for k, v in self._data.items():
+                        if k not in merged:
+                            merged[k] = v
+                    self._data = merged
+                except Exception:
+                    self._data = fresh
+                try:
+                    mutator(self._data)
+                except Exception:
+                    return
+                try:
+                    _atomic_write_json(self.auth_file, dict(self._data))
+                except OSError:
+                    pass
+        except Exception:
             pass
 
     # ------------------------------------------------------------------
@@ -145,8 +309,10 @@ class AuthVault:
 
     def store_token(self, provider: str, token: str) -> None:
         """Store a raw token string as an api_key credential."""
-        self._data[provider] = {"type": "api_key", "key": token}
-        self._save()
+        def _mut(d: Dict[str, Any]) -> None:
+            d[provider] = {"type": "api_key", "key": token}
+
+        self._locked_save(_mut)
 
     def store_oauth(
         self,
@@ -171,14 +337,19 @@ class AuthVault:
             credential["projectId"] = project_id
         if account_id:
             credential["accountId"] = account_id
-        self._data[provider] = credential
-        self._save()
+
+        def _mut(d: Dict[str, Any], _cred: Dict[str, Any] = credential) -> None:
+            d[provider] = _cred
+
+        self._locked_save(_mut)
 
     def remove(self, provider: str) -> None:
         """Remove a provider's credentials."""
-        if provider in self._data:
-            del self._data[provider]
-            self._save()
+        def _mut(d: Dict[str, Any]) -> None:
+            if provider in d:
+                del d[provider]
+
+        self._locked_save(_mut)
 
     def list_providers(self):
         """Return list of providers that have stored credentials."""
@@ -284,8 +455,15 @@ class AuthVault:
                             if "refresh_token" in refreshed:
                                 raw["refresh_token"] = refreshed["refresh_token"]
                             try:
-                                with open(p, "w") as fw:
+                                # Atomic refresh persist: tmp same-dir + replace
+                                # (uses open() so unit-test mock_open still observes write).
+                                _tmp = p.with_name(p.name + ".tmp")
+                                with open(_tmp, "w") as fw:
                                     json.dump(file_data, fw, indent=2)
+                                try:
+                                    os.replace(_tmp, p)
+                                except OSError:
+                                    pass
                             except Exception:
                                 pass
                             return fresh_access

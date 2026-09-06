@@ -1,8 +1,11 @@
+import logging
 import subprocess
 import re
 from dataclasses import dataclass
 from harness.core.allowance import AllowanceGuard, CommandStatus
 from harness.context.compactor import trim_log_output
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class ShellResult:
@@ -17,10 +20,10 @@ class ShellRunner:
     
     # Simple regex to mask potential secrets (e.g., tokens, api keys)
     SECRET_PATTERN = re.compile(
-        r'(?i)(api[_-]?key|token|secret|password)["\']?\s*[:=]\s*["\']?[a-zA-Z0-9\-_]{16,}["\']?'
+        r'(?i)(api[_-]?key|token|secret|password)["\']?\s*[:=]\s*["\']?[a-zA-Z0-9\-_]{10,}["\']?'
     )
 
-    # Extended patterns: sk-, ghp_/gho_, AKIA, Bearer, --token=, PEM header.
+    # Extended patterns: sk-, ghp_/gho_, AKIA, Bearer, --token=, PEM header, ya29., AIza.
     _EXTRA_SECRET_PATTERNS = (
         re.compile(r'sk-[A-Za-z0-9\-_]{16,}'),
         re.compile(r'gh[pousr]_[A-Za-z0-9]{20,}'),
@@ -28,11 +31,17 @@ class ShellRunner:
         re.compile(r'(?i)Bearer\s+[A-Za-z0-9\-._~+/=]{10,}'),
         re.compile(r'(?i)--token[=\s]+[^\s"\'`]+'),
         re.compile(r'-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----'),
+        re.compile(r'ya29\.[A-Za-z0-9\-_]{10,}'),
+        re.compile(r'AIza[A-Za-z0-9\-_]{10,}'),
     )
 
     def __init__(self, allowance_guard: AllowanceGuard | None, timeout: int = 30):
         self.allowance_guard = allowance_guard
-        self.timeout = timeout or 30
+        if timeout == 0:
+            logger.warning("ShellRunner timeout=0 is not allowed; using default 30s")
+            self.timeout = 30
+        else:
+            self.timeout = timeout or 30
 
     def _mask_secrets(self, text: str) -> str:
         """Mask potential secrets in text."""
@@ -54,7 +63,7 @@ class ShellRunner:
             except Exception:
                 status = CommandStatus.ASK
         else:
-            status = CommandStatus.APPROVED
+            status = CommandStatus.ASK
         
         if status == CommandStatus.BLOCKED:
             return ShellResult(
@@ -73,12 +82,17 @@ class ShellRunner:
             )
             
         try:
+            if self.timeout == 0:
+                logger.warning("ShellRunner timeout=0 is not allowed; using default 30s")
+                effective_timeout = 30
+            else:
+                effective_timeout = self.timeout or 30
             process = subprocess.run(
                 command,
                 shell=True,
                 capture_output=True,
                 text=True,
-                timeout=self.timeout or 30
+                timeout=effective_timeout
             )
             
             # Apply masking and compaction
@@ -93,9 +107,14 @@ class ShellRunner:
             )
             
         except subprocess.TimeoutExpired:
+            if self.timeout == 0:
+                logger.warning("ShellRunner timeout=0 is not allowed; using default 30s")
+                effective_timeout = 30
+            else:
+                effective_timeout = self.timeout or 30
             return ShellResult(
                 stdout="",
-                stderr=f"Command timed out after {self.timeout or 30}s",
+                stderr=f"Command timed out after {effective_timeout}s",
                 exit_code=124,
                 command=safe_command
             )
